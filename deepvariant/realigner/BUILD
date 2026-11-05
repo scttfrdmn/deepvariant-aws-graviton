@@ -162,6 +162,25 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "region_realigner",
+    srcs = ["region_realigner.cc"],
+    hdrs = ["region_realigner.h"],
+    deps = [
+        ":cpp_window_selector",
+        ":debruijn_graph",
+        ":fast_pass_aligner",
+        "//deepvariant:allelecounter",
+        "//deepvariant/protos:deepvariant_cc_pb2",
+        "//deepvariant/protos:realigner_cc_pb2",
+        "//third_party/nucleus/io:reference",
+        "//third_party/nucleus/protos:range_cc_pb2",
+        "//third_party/nucleus/protos:reads_cc_pb2",
+        "//third_party/nucleus/util:cpp_utils",
+        "//third_party/nucleus/util:proto_ptr",
+    ],
+)
+
 cc_test(
     name = "fast_pass_aligner_test",
     size = "small",

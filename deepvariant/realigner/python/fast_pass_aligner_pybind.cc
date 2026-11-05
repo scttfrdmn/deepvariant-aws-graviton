@@ -41,6 +41,8 @@
 #include <vector>
 
 #include "deepvariant/realigner/fast_pass_aligner.h"
+#include "deepvariant/realigner/region_realigner.h"
+#include "third_party/nucleus/io/reference.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_status.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_statusor.h"
 #include "third_party/nucleus/util/python/type_caster_nucleus_proto_ptr.h"
@@ -93,4 +95,26 @@ PYBIND11_MODULE(fast_pass_aligner, m) {
              // bug doing a move to be safe.
              // https://sigcpp.github.io/2020/06/08/return-value-optimization
            });
+
+  // Realigner.realign_reads for one region in C++ (deepvariant-aws-graviton#10):
+  // returns (order, replaced_pos, replaced, last_read_size), or None when the
+  // configuration isn't covered and Python should run.
+  m.def(
+      "realign_region",
+      [](const std::vector<
+             nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>& reads,
+         const nucleus::genomics::v1::Range& region,
+         const nucleus::GenomeReference* ref, const RealignerOptions& config,
+         bool ws_light) -> py::object {
+        std::vector<const nucleus::genomics::v1::Read*> ptrs;
+        ptrs.reserve(reads.size());
+        for (const auto& r : reads) ptrs.push_back(r.p_);
+        RegionRealignment out;
+        if (!RealignRegion(ptrs, region, *ref, config, ws_light, &out))
+          return py::none();
+        return py::make_tuple(std::move(out.order), std::move(out.replaced_pos),
+                              std::move(out.replaced), out.last_read_size);
+      },
+      py::arg("reads"), py::arg("region"), py::arg("ref"), py::arg("config"),
+      py::arg("ws_light"));
 }

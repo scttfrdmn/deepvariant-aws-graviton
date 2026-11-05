@@ -12,6 +12,8 @@ pybind_extension(
     srcs = ["fast_pass_aligner_pybind.cc"],
     deps = [
         "//deepvariant/realigner:fast_pass_aligner",
+        "//deepvariant/realigner:region_realigner",
+        "//third_party/nucleus/io:reference",
         "//third_party/nucleus/core/python:type_caster_nucleus_status",
         "//third_party/nucleus/core/python:type_caster_nucleus_statusor",
         "//third_party/nucleus/protos:reads_cc_pb2",
@@ -25,6 +27,8 @@ pybind_library(
     srcs = ["fast_pass_aligner_pybind.cc"],
     deps = [
         "//deepvariant/realigner:fast_pass_aligner",
+        "//deepvariant/realigner:region_realigner",
+        "//third_party/nucleus/io:reference",
         "//third_party/nucleus/core/python:type_caster_nucleus_status",
         "//third_party/nucleus/core/python:type_caster_nucleus_statusor",
         "//third_party/nucleus/protos:reads_cc_pb2",

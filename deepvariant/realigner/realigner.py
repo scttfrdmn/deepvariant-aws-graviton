@@ -666,6 +666,21 @@ def split_reads(reads):
   return read_split
 
 
+def _use_cpp_region_realigner(realigner):
+  """C++ realign_reads for the production path (deepvariant-aws-graviton#10).
+
+  DV_REGION_PY=1 keeps the Python path; so do diagnostics, split reads, the
+  window-selector self-check and the fast-pass copy A/B switch.
+  """
+  if os.environ.get('DV_REGION_PY') or os.environ.get('DV_WS_SELFCHECK'):
+    return False
+  if os.environ.get('DV_FPA_COPY'):
+    return False
+  if realigner.diagnostic_logger.enabled:
+    return False
+  return not realigner.config.split_skip_reads
+
+
 class Realigner(object):
   """Realign reads in regions to assembled haplotypes.
 
@@ -823,6 +838,27 @@ class Realigner(object):
 
     if not reads:
       return [], []
+
+    if _use_cpp_region_realigner(self):
+      ws = self.config.ws_config
+      light = (
+          ws.window_selector_model.model_type
+          == realigner_pb2.WindowSelectorModel.VARIANT_READS
+          and os.environ.get('DV_WS_LIGHT', '1') != '0'
+      )
+      res = fast_pass_aligner.realign_region(
+          reads, region, self.ref_reader.c_reader, self.config, light
+      )
+      if res is not None:
+        order, replaced_pos, replaced, last_read_size = res
+        out = [reads[i] for i in order]
+        for p, r in zip(replaced_pos, replaced):
+          out[p] = r
+        if last_read_size >= 0:
+          self.config.aln_config.read_size = last_read_size
+          self.config.aln_config.force_alignment = False
+        # make_examples' caller doesn't use the candidate haplotypes.
+        return None, out
 
     # Split reads containing SKIP operations.
     if self.config.split_skip_reads:
