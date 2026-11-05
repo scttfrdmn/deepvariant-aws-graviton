@@ -159,30 +159,52 @@ Vertex DeBruijnGraph::VertexForKmer(string_view kmer) const {
   return kmer_to_vertex_.at(kmer);
 }
 
+// The same indices as before (vertices() order), stored in the vertex itself
+// instead of a std::map<Vertex, int>, so index lookups in DFS are O(1).
 void DeBruijnGraph::RebuildIndexMap() {
-  std::map<Vertex, int> table;
   VertexIterator vi, vend;
   std::tie(vi, vend) = boost::vertices(g_);
   int index = 0;
   for (; vi != vend; ++vi) {
-    table[*vi] = index;
+    g_[*vi].index = index;
     ++index;
   }
-  vertex_index_map_ = table;
 }
 
 VertexIndexMap DeBruijnGraph::IndexMap() const {
-  boost::const_associative_property_map<RawVertexIndexMap> vmap(
-      vertex_index_map_);
-  return vmap;
+  return boost::get(&VertexInfo::index, g_);
 }
 
+// Whether the directed graph has a cycle: iterative three-color DFS over all
+// vertices. Cycle existence doesn't depend on traversal order, so this is the
+// same answer as boost::depth_first_search with a back-edge visitor.
 bool DeBruijnGraph::HasCycle() const {
-  bool has_cycle = false;
-  CycleDetector cycle_detector(&has_cycle);
-  boost::depth_first_search(
-      g_, boost::visitor(cycle_detector).vertex_index_map(IndexMap()));
-  return has_cycle;
+  const int n = boost::num_vertices(g_);
+  std::vector<uint8_t> color(n, 0);  // 0 white, 1 on stack, 2 done
+  std::vector<std::pair<Vertex, AdjacencyIterator>> stack;
+  VertexIterator vi, vend;
+  for (std::tie(vi, vend) = boost::vertices(g_); vi != vend; ++vi) {
+    if (color[g_[*vi].index] != 0) continue;
+    color[g_[*vi].index] = 1;
+    stack.emplace_back(*vi, boost::adjacent_vertices(*vi, g_).first);
+    while (!stack.empty()) {
+      auto& top = stack.back();
+      if (top.second == boost::adjacent_vertices(top.first, g_).second) {
+        color[g_[top.first].index] = 2;
+        stack.pop_back();
+        continue;
+      }
+      const Vertex w = *top.second;
+      ++top.second;
+      const uint8_t c = color[g_[w].index];
+      if (c == 1) return true;  // back edge
+      if (c == 0) {
+        color[g_[w].index] = 1;
+        stack.emplace_back(w, boost::adjacent_vertices(w, g_).first);
+      }
+    }
+  }
+  return false;
 }
 
 DeBruijnGraph::DeBruijnGraph(

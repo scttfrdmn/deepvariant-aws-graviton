@@ -54,6 +54,9 @@ using std::string;
 
 struct VertexInfo {
   string kmer;
+  // Position of the vertex in boost::vertices(g_) order, set by
+  // RebuildIndexMap (the vertex_index_t property algorithms use).
+  int index = 0;
 };
 
 struct EdgeInfo {
@@ -80,9 +83,8 @@ class DeBruijnGraph {
   using Edge = boost::graph_traits<BoostGraph>::edge_descriptor;
   using Path = std::vector<Vertex>;
 
-  using RawVertexIndexMap = std::map<Vertex, int>;
   using VertexIndexMap =
-      boost::const_associative_property_map<RawVertexIndexMap>;
+      boost::property_map<BoostGraph, int VertexInfo::*>::const_type;
 
   using Options = DeBruijnGraphOptions;
 
@@ -177,7 +179,6 @@ class DeBruijnGraph {
   // N.B.: kmer strings are owned by VertexInfo objects;
   // map keys are merely pointers.
   absl::flat_hash_map<absl::string_view, Vertex> kmer_to_vertex_;
-  RawVertexIndexMap vertex_index_map_;
 };
 
 
