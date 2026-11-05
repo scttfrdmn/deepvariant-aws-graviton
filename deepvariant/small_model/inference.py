@@ -130,6 +130,63 @@ class SmallModelVariantCaller:
         ),
     )
 
+  def _classify_tagged(self, examples: np.ndarray):
+    """classify(), with eager float32 outputs as numpy rows, tagged.
+
+    Returns (predictions, eager): eager[i] is True when predictions[i] came
+    from self.classifier(...) (an EagerTensor in classify()) and is now a
+    float32 numpy row. Values are identical; only the container changes, and
+    _eager_row_passes reproduces TF's float32 scalar arithmetic for them.
+    (deepvariant-aws-graviton)
+    """
+    predictions, eager = [], []
+    for i in range(0, len(examples), self.batch_size):
+      batch = examples[i : i + self.batch_size]
+      if len(batch) < self.batch_size:
+        out = self.classifier(batch, training=False)
+        if getattr(out, 'dtype', None) == tf.float32 and not os.environ.get(
+            'DV_SMALL_MODEL_EAGER'
+        ):
+          rows = list(out.numpy())
+          predictions.extend(rows)
+          eager.extend([True] * len(rows))
+        else:
+          rows = list(out)
+          predictions.extend(rows)
+          eager.extend([False] * len(rows))
+      else:
+        rows = list(self.classifier.predict_on_batch(batch))
+        predictions.extend(rows)
+        eager.extend([False] * len(rows))
+    return predictions, eager
+
+  def _eager_row_passes(self, candidate, alt_allele_indices, row) -> bool:
+    """_accept_call_result for a float32 row as if it were an EagerTensor.
+
+    ptrue_to_bounded_phred(max(t), MAX) on an EagerTensor computes:
+      max: float32 comparisons, first maximum kept (same on numpy float32);
+      min(p, MAX): `MAX < p` dispatches to tf.greater(p, float32(MAX));
+      1.0 - p: tf.subtract in float32 (np.float32(1.0) - p here);
+      1.0 - MAX: Python float.
+    """
+    if variant_utils.is_snp(
+        candidate.variant,
+        exclude_alleles=make_small_model_examples.get_exclude_alleles(
+            candidate, alt_allele_indices
+        ),
+    ):
+      threshold = self.snp_gq_threshold
+    else:
+      threshold = self.indel_gq_threshold
+    p = max(row)
+    if not 0 <= p <= 1:
+      raise ValueError('ptrue must be between zero and one: {}'.format(p))
+    if np.float32(self.MAX_CONFIDENCE) < p:
+      perror = 1.0 - self.MAX_CONFIDENCE
+    else:
+      perror = np.float32(1.0) - p
+    return genomics_math.perror_to_phred(float(perror)) >= threshold
+
   def classify(self, examples: np.ndarray) -> list[tuple[float, ...]]:
     """Classifies the given example."""
     predictions = []
@@ -152,15 +209,22 @@ class SmallModelVariantCaller:
       list[deepvariant_pb2.DeepVariantCall],
   ]:
     """Calls variants on the given examples."""
-    genotype_probabilities = self.classify(np.array(examples))
+    genotype_probabilities, eager = self._classify_tagged(np.array(examples))
 
     call_variant_outputs = []
     candidates_not_called_by_id = {}
-    for (candidate, alt_allele_indices), probability in zip(
+    for (candidate, alt_allele_indices), probability, is_eager in zip(
         candidates_with_alt_allele_indices,
         genotype_probabilities,
+        eager,
     ):
-      if self._accept_call_result(candidate, alt_allele_indices, probability):
+      if (
+          self._eager_row_passes(candidate, alt_allele_indices, probability)
+          if is_eager
+          else self._accept_call_result(
+              candidate, alt_allele_indices, probability
+          )
+      ):
         call_variant_outputs.append(
             self._get_call_variant_outputs(
                 candidate, probability, alt_allele_indices
