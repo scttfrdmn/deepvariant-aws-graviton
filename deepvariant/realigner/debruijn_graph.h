@@ -170,6 +170,18 @@ class DeBruijnGraph {
   int KmerSize() const { return k_; }
 
  private:
+  // Flat engine (deepvariant-aws-graviton#10): Build computes the candidate
+  // haplotypes with flat arrays and keeps only the result. DV_DBG_BOOST=1 uses
+  // the boost graph as before; DV_DBG_SELFCHECK=1 runs both and compares.
+  DeBruijnGraph() = default;
+  static std::unique_ptr<DeBruijnGraph> BuildBoost(
+      absl::string_view ref,
+      const std::vector<
+          nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>& reads,
+      const Options& options);
+  bool flat_ = false;
+  std::vector<string> flat_haplotypes_;
+
   BoostGraph g_;
   Options options_;
   int k_;

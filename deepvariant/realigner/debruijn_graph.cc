@@ -32,6 +32,9 @@
 #include "deepvariant/realigner/debruijn_graph.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <iterator>
 #include <map>
@@ -49,6 +52,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_set.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -263,7 +267,387 @@ KBounds KMinMaxFromReference(const string_view ref,
   return bounds;
 }
 
+namespace {
+
+// Flat De Bruijn graph for one k (deepvariant-aws-graviton#10). Same graph as
+// the boost version: vertices are distinct k-mers, edges are distinct
+// (from, to) pairs with weight = multiplicity and is_ref; k-mers are views
+// into the reference and into one buffer of upper-cased read bases (built once
+// per Build, not per k). Buffers keep their capacity across k and windows.
+//
+// Order. The boost graph keeps out-edges in a std::set ordered by the target
+// vertex descriptor, which for listS vertices is a heap address. Every output
+// is independent of that order (HasCycle, reachability, the sorted haplotype
+// list) except CandidatePaths' max_num_paths cut-off, which checks the running
+// path count before each BFS pop; the last count checked depends on which
+// path the BFS pops last. Here out-edges are in insertion order.
+// DV_DBG_SELFCHECK=1 compares both engines window by window.
+// 2-bit codes for upper-case ACGT; every other character (N, IUPAC, lower
+// case) is -1, and k-mers containing one are keyed by their string, so the
+// vertex identity is the k-mer string exactly as in the boost version.
+struct BaseCodes {
+  int8_t c[256];
+  BaseCodes() {
+    for (int i = 0; i < 256; ++i) c[i] = -1;
+    c['A'] = 0; c['C'] = 1; c['G'] = 2; c['T'] = 3;
+  }
+};
+const BaseCodes kCodes;
+
+struct FlatGraph {
+  struct E { int to, next, weight; bool is_ref, alive; };
+  int k = 0;
+  uint64_t mask = 0;
+  std::vector<absl::string_view> kmer;
+  std::vector<int> head, tail, out_deg;
+  std::vector<E> edges;
+  absl::flat_hash_map<absl::string_view, int> index;      // k > 32 or non-ACGT
+  absl::flat_hash_map<uint64_t, int> index64;             // k <= 32, ACGT
+  std::vector<uint8_t> color;
+  std::vector<std::pair<int, int>> stack;
+
+  void Reset(int k_in, size_t hint) {
+    k = k_in;
+    mask = k >= 32 ? ~uint64_t{0} : ((uint64_t{1} << (2 * k)) - 1);
+    kmer.clear(); head.clear(); tail.clear(); out_deg.clear(); edges.clear();
+    index.clear();
+    index64.clear();
+    if (k <= 32) index64.reserve(hint); else index.reserve(hint);
+  }
+  int NewVertex(absl::string_view km) {
+    const int v = static_cast<int>(kmer.size());
+    kmer.push_back(km);
+    head.push_back(-1); tail.push_back(-1); out_deg.push_back(0);
+    return v;
+  }
+  int EnsureStr(absl::string_view km) {
+    auto it = index.find(km);
+    if (it != index.end()) return it->second;
+    const int v = NewVertex(km);
+    index.emplace(km, v);
+    return v;
+  }
+  int Ensure64(uint64_t key, absl::string_view km) {
+    auto [it, inserted] = index64.try_emplace(key, 0);
+    if (inserted) it->second = NewVertex(km);
+    return it->second;
+  }
+  // Vertex for one k-mer (source/sink lookup); -1 if absent.
+  int Find(absl::string_view km) const {
+    if (k <= 32) {
+      uint64_t key = 0;
+      bool acgt = true;
+      for (char ch : km) {
+        const int8_t c = kCodes.c[static_cast<uint8_t>(ch)];
+        if (c < 0) { acgt = false; break; }
+        key = (key << 2) | c;
+      }
+      if (acgt) { auto it = index64.find(key); return it == index64.end() ? -1 : it->second; }
+    }
+    auto it = index.find(km);
+    return it == index.end() ? -1 : it->second;
+  }
+  void AddEdge(int from, int to, bool is_ref) {
+    for (int e = head[from]; e != -1; e = edges[e].next) {
+      if (edges[e].to == to) {
+        edges[e].weight++;
+        edges[e].is_ref |= is_ref;
+        return;
+      }
+    }
+    const int id = static_cast<int>(edges.size());
+    edges.push_back(E{to, -1, 1, is_ref, true});
+    if (tail[from] == -1) head[from] = id; else edges[tail[from]].next = id;
+    tail[from] = id;
+    out_deg[from]++;
+  }
+  void AddKmersAndEdges(absl::string_view bases, int start, int end, bool is_ref) {
+    CHECK_GE(start, 0);
+    CHECK_LE(start + k, bases.size());
+    CHECK_LE(end + k, bases.size());
+    if (end <= 0) return;
+    if (k > 32) {
+      int prev = EnsureStr(bases.substr(start, k));
+      for (int i = start + 1; i <= end; ++i) {
+        const int cur = EnsureStr(bases.substr(i, k));
+        AddEdge(prev, cur, is_ref);
+        prev = cur;
+      }
+      return;
+    }
+    // Rolling 2-bit key over k-mers bases[i, i + k); `bad` is the last index
+    // with a non-ACGT character, so k-mer i is all-ACGT iff bad < i.
+    uint64_t key = 0;
+    int bad = start - 1;
+    for (int j = start; j < start + k; ++j) {
+      const int8_t c = kCodes.c[static_cast<uint8_t>(bases[j])];
+      if (c < 0) { bad = j; key = key << 2; } else { key = (key << 2) | c; }
+    }
+    key &= mask;
+    auto vertex_at = [&](int i) {
+      return bad < i ? Ensure64(key, bases.substr(i, k)) : EnsureStr(bases.substr(i, k));
+    };
+    int prev = vertex_at(start);
+    for (int i = start + 1; i <= end; ++i) {
+      const int j = i + k - 1;
+      const int8_t c = kCodes.c[static_cast<uint8_t>(bases[j])];
+      if (c < 0) { bad = j; key = (key << 2) & mask; } else { key = ((key << 2) | c) & mask; }
+      const int cur = vertex_at(i);
+      AddEdge(prev, cur, is_ref);
+      prev = cur;
+    }
+  }
+  bool HasCycle() {
+    const int n = static_cast<int>(kmer.size());
+    color.assign(n, 0);
+    stack.clear();
+    for (int s = 0; s < n; ++s) {
+      if (color[s]) continue;
+      color[s] = 1;
+      stack.emplace_back(s, head[s]);
+      while (!stack.empty()) {
+        auto& top = stack.back();
+        if (top.second == -1) { color[top.first] = 2; stack.pop_back(); continue; }
+        const int w = edges[top.second].to;
+        top.second = edges[top.second].next;
+        if (color[w] == 1) return true;
+        if (color[w] == 0) { color[w] = 1; stack.emplace_back(w, head[w]); }
+      }
+    }
+    return false;
+  }
+};
+
+struct FlatScratch {
+  FlatGraph g;
+  std::string read_bases;                        // upper-cased, all reads
+  std::vector<std::pair<int, int>> read_spans;   // offset, length
+  std::vector<const Read*> read_ptrs;
+  absl::flat_hash_set<absl::string_view> ref_kmers;
+  absl::flat_hash_set<uint64_t> ref_kmers64;
+  std::vector<int> in_head, in_next, in_from, rstack;
+  std::vector<uint8_t> fwd, rev;
+  std::vector<int> pnode_v, pnode_parent, queue, terminated;
+};
+
+FlatScratch& Scratch() {
+  static thread_local FlatScratch s;
+  return s;
+}
+
+// The edges of the pruned graph, iterated as CandidatePaths does.
+bool FlatCandidateHaplotypes(FlatScratch& sc, int source, int sink,
+                             const DeBruijnGraph::Options& options,
+                             std::vector<std::string>* out) {
+  FlatGraph& g = sc.g;
+  const int n = static_cast<int>(g.kmer.size());
+  // Prune: drop non-reference edges below min_edge_weight.
+  for (auto& e : g.edges)
+    if (!e.is_ref && e.weight < options.min_edge_weight()) e.alive = false;
+  // Forward reachability from source, reverse reachability from sink.
+  sc.fwd.assign(n, 0); sc.rev.assign(n, 0);
+  sc.rstack.clear();
+  sc.fwd[source] = 1; sc.rstack.push_back(source);
+  while (!sc.rstack.empty()) {
+    const int v = sc.rstack.back(); sc.rstack.pop_back();
+    for (int e = g.head[v]; e != -1; e = g.edges[e].next)
+      if (g.edges[e].alive && !sc.fwd[g.edges[e].to]) { sc.fwd[g.edges[e].to] = 1; sc.rstack.push_back(g.edges[e].to); }
+  }
+  sc.in_head.assign(n, -1); sc.in_next.assign(g.edges.size(), -1); sc.in_from.assign(g.edges.size(), -1);
+  for (int v = 0; v < n; ++v)
+    for (int e = g.head[v]; e != -1; e = g.edges[e].next)
+      if (g.edges[e].alive) { const int t = g.edges[e].to; sc.in_from[e] = v; sc.in_next[e] = sc.in_head[t]; sc.in_head[t] = e; }
+  sc.rev[sink] = 1; sc.rstack.push_back(sink);
+  while (!sc.rstack.empty()) {
+    const int v = sc.rstack.back(); sc.rstack.pop_back();
+    for (int e = sc.in_head[v]; e != -1; e = sc.in_next[e])
+      if (!sc.rev[sc.in_from[e]]) { sc.rev[sc.in_from[e]] = 1; sc.rstack.push_back(sc.in_from[e]); }
+  }
+  // Remove vertices not on a source-to-sink path, with all their edges.
+  for (int v = 0; v < n; ++v) {
+    const bool keep = sc.fwd[v] && sc.rev[v];
+    for (int e = g.head[v]; e != -1; e = g.edges[e].next)
+      if (!keep || !(sc.fwd[g.edges[e].to] && sc.rev[g.edges[e].to])) g.edges[e].alive = false;
+  }
+  for (int v = 0; v < n; ++v) {
+    int d = 0;
+    for (int e = g.head[v]; e != -1; e = g.edges[e].next) d += g.edges[e].alive;
+    g.out_deg[v] = d;
+  }
+  // CandidatePaths: BFS over paths, as a tree of path nodes (no path copies).
+  CHECK_GT(g.out_deg[source], 0);
+  sc.pnode_v.clear(); sc.pnode_parent.clear(); sc.queue.clear(); sc.terminated.clear();
+  sc.pnode_v.push_back(source); sc.pnode_parent.push_back(-1);
+  sc.queue.push_back(0);
+  size_t qhead = 0;
+  while (qhead < sc.queue.size()) {
+    const int n_total = static_cast<int>(sc.terminated.size() + (sc.queue.size() - qhead));
+    if (n_total > options.max_num_paths()) { out->clear(); return true; }
+    const int node = sc.queue[qhead++];
+    const int last = sc.pnode_v[node];
+    for (int e = g.head[last]; e != -1; e = g.edges[e].next) {
+      if (!g.edges[e].alive) continue;
+      const int w = g.edges[e].to;
+      const int child = static_cast<int>(sc.pnode_v.size());
+      sc.pnode_v.push_back(w); sc.pnode_parent.push_back(node);
+      if (w == sink || g.out_deg[w] == 0) sc.terminated.push_back(child);
+      else sc.queue.push_back(child);
+    }
+  }
+  out->clear();
+  out->reserve(sc.terminated.size());
+  std::vector<int> chain;
+  for (int t : sc.terminated) {
+    chain.clear();
+    for (int x = t; x != -1; x = sc.pnode_parent[x]) chain.push_back(sc.pnode_v[x]);
+    std::string h;
+    h.reserve(chain.size() + g.k);
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) h.push_back(g.kmer[*it][0]);
+    if (!chain.empty()) h.append(g.kmer[chain.front()].substr(1, g.k - 1));
+    out->push_back(std::move(h));
+  }
+  std::sort(out->begin(), out->end());
+  return true;
+}
+
+// Build() with the flat engine. Returns false if no k works (Build -> nullptr);
+// otherwise *k_used and *haplotypes.
+bool FlatBuild(absl::string_view ref,
+               const std::vector<nucleus::ConstProtoPtr<const Read>>& reads,
+               const DeBruijnGraph::Options& options, int* k_used,
+               std::vector<std::string>* haplotypes) {
+  FlatScratch& sc = Scratch();
+  // KMinMaxFromReference: the smallest k whose reference k-mers are distinct.
+  int min_k = -1;
+  const int max_k = std::min(options.max_k(), static_cast<int>(ref.size()) - 1);
+  for (int k = options.min_k(); k <= max_k; k += options.step_k()) {
+    bool has_cycle = false;
+    sc.ref_kmers.clear();
+    sc.ref_kmers64.clear();
+    const int n_kmers = static_cast<int>(ref.size()) - k + 1;
+    if (k <= 32) {
+      sc.ref_kmers64.reserve(n_kmers);
+      const uint64_t mask = k >= 32 ? ~uint64_t{0} : ((uint64_t{1} << (2 * k)) - 1);
+      uint64_t key = 0;
+      int bad = -1;
+      for (int j = 0; j < static_cast<int>(ref.size()) && !has_cycle; ++j) {
+        const int8_t c = kCodes.c[static_cast<uint8_t>(ref[j])];
+        if (c < 0) { bad = j; key = (key << 2) & mask; } else { key = ((key << 2) | c) & mask; }
+        const int i = j - k + 1;
+        if (i < 0) continue;
+        if (bad < i) { if (!sc.ref_kmers64.insert(key).second) has_cycle = true; }
+        else if (!sc.ref_kmers.insert(ref.substr(i, k)).second) has_cycle = true;
+      }
+    } else {
+      sc.ref_kmers.reserve(n_kmers);
+      for (int i = 0; i < n_kmers; i++) {
+        if (!sc.ref_kmers.insert(ref.substr(i, k)).second) { has_cycle = true; break; }
+      }
+    }
+    if (!has_cycle) { min_k = k; break; }
+  }
+  if (min_k == -1) return false;
+  // Upper-cased read bases once (the boost version does it per k).
+  size_t total = 0;
+  sc.read_ptrs.clear();
+  for (const auto& rp : reads) {
+    const Read& r = *rp.p_;
+    if (r.alignment().mapping_quality() >= options.min_mapq()) {
+      sc.read_ptrs.push_back(&r);
+      total += r.aligned_sequence().size();
+    }
+  }
+  sc.read_bases.clear();
+  sc.read_bases.reserve(total);
+  sc.read_spans.clear();
+  for (const Read* r : sc.read_ptrs) {
+    const int off = static_cast<int>(sc.read_bases.size());
+    for (char c : r->aligned_sequence()) sc.read_bases.push_back(absl::ascii_toupper(c));
+    sc.read_spans.emplace_back(off, static_cast<int>(r->aligned_sequence().size()));
+  }
+  const absl::string_view all_bases(sc.read_bases);
+  for (int k = min_k; k <= max_k; k += options.step_k()) {
+    FlatGraph& g = sc.g;
+    CHECK_GT(k, 0);
+    CHECK(static_cast<uint32_t>(k) < ref.size());
+    g.Reset(k, ref.size() + total / 8);
+    g.AddKmersAndEdges(ref, 0, ref.size() - k, true);
+    const int source = g.Find(ref.substr(0, k));
+    const int sink = g.Find(ref.substr(ref.size() - k, k));
+    CHECK(source >= 0 && sink >= 0);
+    for (size_t r = 0; r < sc.read_ptrs.size(); ++r) {
+      const Read& read = *sc.read_ptrs[r];
+      const absl::string_view bases = all_bases.substr(sc.read_spans[r].first, sc.read_spans[r].second);
+      const auto& qual = read.aligned_quality();
+      const int size = static_cast<int>(bases.size());
+      auto next_bad = [&](int start) -> int {
+        for (int i = start; i < size; ++i)
+          if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
+              qual[i] < options.min_base_quality())
+            return i;
+        return size;
+      };
+      const int stop = size - k;
+      int i = 0;
+      while (i < stop) {
+        const int nb = next_bad(i);
+        g.AddKmersAndEdges(bases, i, nb - k, false);
+        i = nb + 1;
+      }
+    }
+    if (g.HasCycle()) continue;
+    *k_used = k;
+    return FlatCandidateHaplotypes(sc, source, sink, options, haplotypes);
+  }
+  return false;
+}
+
+bool DbgEnv(const char* name) {
+  const char* v = getenv(name);
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+std::atomic<long> g_dbg_checked{0}, g_dbg_mismatch{0};
+void DbgReport() {
+  if (g_dbg_checked.load())
+    fprintf(stderr, "DV_DBG_SELFCHECK windows %ld mismatched %ld\n",
+            g_dbg_checked.load(), g_dbg_mismatch.load());
+}
+
+}  // namespace
+
 std::unique_ptr<DeBruijnGraph> DeBruijnGraph::Build(
+    absl::string_view ref,
+    const std::vector<nucleus::ConstProtoPtr<const Read>>& reads,
+    const DeBruijnGraph::Options& options) {
+  static const bool use_boost = DbgEnv("DV_DBG_BOOST");
+  static const bool selfcheck = DbgEnv("DV_DBG_SELFCHECK");
+  if (use_boost) return BuildBoost(ref, reads, options);
+  int k = 0;
+  std::vector<std::string> haps;
+  const bool ok = FlatBuild(ref, reads, options, &k, &haps);
+  if (selfcheck) {
+    static bool reg = (atexit(DbgReport), true);
+    (void)reg;
+    std::unique_ptr<DeBruijnGraph> b = BuildBoost(ref, reads, options);
+    ++g_dbg_checked;
+    const bool same = (ok == (b != nullptr)) &&
+                      (!ok || (k == b->KmerSize() && haps == b->CandidateHaplotypes()));
+    if (!same && g_dbg_mismatch++ < 5)
+      fprintf(stderr, "DV_DBG_SELFCHECK mismatch: flat ok=%d k=%d n=%zu; boost ok=%d k=%d n=%zu\n",
+              ok, k, haps.size(), b != nullptr, b ? b->KmerSize() : 0,
+              b ? b->CandidateHaplotypes().size() : 0);
+  }
+  if (!ok) return nullptr;
+  std::unique_ptr<DeBruijnGraph> graph(new DeBruijnGraph());
+  graph->flat_ = true;
+  graph->k_ = k;
+  graph->options_ = options;
+  graph->flat_haplotypes_ = std::move(haps);
+  return graph;
+}
+
+std::unique_ptr<DeBruijnGraph> DeBruijnGraph::BuildBoost(
     absl::string_view ref,
     const std::vector<nucleus::ConstProtoPtr<const Read>>& reads,
     const DeBruijnGraph::Options& options) {
@@ -422,6 +806,7 @@ string DeBruijnGraph::HaplotypeForPath(const Path& path) const {
 }
 
 std::vector<std::string> DeBruijnGraph::CandidateHaplotypes() const {
+  if (flat_) return flat_haplotypes_;
   std::vector<std::string> haplotypes;
   for (const Path& path : CandidatePaths()) {
     haplotypes.push_back(HaplotypeForPath(path));
@@ -431,6 +816,10 @@ std::vector<std::string> DeBruijnGraph::CandidateHaplotypes() const {
 }
 
 string DeBruijnGraph::GraphViz() const {
+  if (flat_) {
+    LOG(WARNING) << "GraphViz needs the boost graph; set DV_DBG_BOOST=1";
+    return "";
+  }
   std::stringstream graphviz;
   auto vertex_label_writer = boost::make_label_writer(
       boost::get(&VertexInfo::kmer, g_));
