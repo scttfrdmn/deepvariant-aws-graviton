@@ -71,8 +71,22 @@ bool AreCanonicalBases(absl::string_view bases,
 
 // Returns true if base is one of canonical bases specified in the
 // CanonicalBases canon parameter.
-bool IsCanonicalBase(const char base,
-                     CanonicalBases canon = CanonicalBases::ACGT);
+// Inline (deepvariant-aws-graviton): the same membership test as
+// GetCanonicalBases(canon).find(base) != npos, i.e. base in "ACGT" or "ACGTN".
+inline bool IsCanonicalBase(const char base,
+                            CanonicalBases canon = CanonicalBases::ACGT) {
+  switch (base) {
+    case 'A':
+    case 'C':
+    case 'G':
+    case 'T':
+      return true;
+    case 'N':
+      return canon == CanonicalBases::ACGTN;
+    default:
+      return false;
+  }
+}
 
 // Creates a Position proto from chr and pos.
 nucleus::genomics::v1::Position MakePosition(absl::string_view chr, int64 pos,
