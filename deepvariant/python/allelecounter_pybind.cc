@@ -29,6 +29,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <array>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -47,6 +48,7 @@
 #include <pybind11/stl.h>
 
 #include "deepvariant/allelecounter.h"
+#include "deepvariant/gvcf_blocks.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_status.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_statusor.h"
 #include "third_party/nucleus/protos/cigar.pb.h"
@@ -90,4 +92,37 @@ PYBIND11_MODULE(allelecounter, m) {
            })
       .def("summary_counts", &AlleleCounter::SummaryCounts)
       .def("counts", &AlleleCounter::Counts);
+
+  // gVCF blocks in C++ (deepvariant-aws-graviton): see gvcf_blocks.h.
+  py::class_<GvcfTable>(m, "GvcfTable")
+      .def(py::init([](int max_cov, const std::vector<int>& gq0,
+                       const std::vector<int>& gq1,
+                       const std::vector<std::array<double, 3>>& l0,
+                       const std::vector<std::array<double, 3>>& l1) {
+        GvcfTable t;
+        t.max_cache_coverage = max_cov;
+        t.gq[0] = gq0; t.gq[1] = gq1;
+        t.likelihoods[0] = l0; t.likelihoods[1] = l1;
+        return t;
+      }));
+  m.def(
+      "make_gvcf_records",
+      [](const AlleleCounter& counter, int left_padding, int right_padding,
+         const GvcfTable& table, const std::string& sample_name,
+         int gq_resolution, bool include_med_dp,
+         const std::vector<std::string>& haploid_contigs) {
+        GvcfOptions o;
+        o.sample_name = sample_name;
+        o.gq_resolution = gq_resolution;
+        o.include_med_dp = include_med_dp;
+        o.haploid_contigs.insert(haploid_contigs.begin(), haploid_contigs.end());
+        std::vector<std::string> recs =
+            MakeGvcfRecords(counter, left_padding, right_padding, table, o);
+        py::list out;
+        for (auto& r : recs) out.append(py::bytes(r));
+        return out;
+      },
+      py::arg("counter"), py::arg("left_padding"), py::arg("right_padding"),
+      py::arg("table"), py::arg("sample_name"), py::arg("gq_resolution"),
+      py::arg("include_med_dp"), py::arg("haploid_contigs"));
 }

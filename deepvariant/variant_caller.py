@@ -29,6 +29,7 @@
 """A VariantCaller producing DeepVariantCall and gVCF records."""
 
 import abc
+import os
 import collections
 import itertools
 import math
@@ -452,7 +453,20 @@ class VariantCaller(metaclass=abc.ABCMeta):
     )
 
     gvcfs = []
-    if include_gvcfs:
+    if include_gvcfs and self._use_cpp_gvcfs():
+      # C++ port of make_gvcfs for the cached-table path; returns serialized
+      # Variant protos (deepvariant-aws-graviton). DV_GVCF_PY=1 restores Python.
+      gvcfs = allelecounter.make_gvcf_records(
+          allele_counters[target_sample],
+          left_padding,
+          right_padding,
+          self._cpp_gvcf_table(),
+          self.options.sample_name,
+          self.options.gq_resolution,
+          include_med_dp,
+          list(self.options.haploid_contigs),
+      )
+    elif include_gvcfs:
       gvcfs = list(
           self.make_gvcfs(
               allele_counters[target_sample].summary_counts(
@@ -462,6 +476,27 @@ class VariantCaller(metaclass=abc.ABCMeta):
           )
       )
     return candidates, gvcfs
+
+  def _use_cpp_gvcfs(self):
+    return (
+        self.table is not None
+        and not self.options.par_regions_bed
+        and not os.environ.get('DV_GVCF_PY')
+    )
+
+  def _cpp_gvcf_table(self):
+    if getattr(self, '_gvcf_table', None) is None:
+      gq = [[], []]
+      gl = [[], []]
+      for hap in (0, 1):
+        for row in self.table[hap]:
+          for g, l in row:
+            gq[hap].append(int(g))
+            gl[hap].append([float(x) for x in l])
+      self._gvcf_table = allelecounter.GvcfTable(
+          self.max_cache_coverage, gq[0], gq[1], gl[0], gl[1]
+      )
+    return self._gvcf_table
 
   @abc.abstractmethod
   def get_candidates(

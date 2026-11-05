@@ -1350,6 +1350,9 @@ class OutputsWriter:
     writer = self._writers[writer_name]
     if writer:
       for proto in protos:
+        if isinstance(proto, bytes):  # already serialized (C++ gVCF records)
+          writer.write(proto)
+          continue
         writer.write(
             proto.SerializeToString(
                 deterministic=self._deterministic_serialization

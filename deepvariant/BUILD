@@ -72,9 +72,17 @@ py_library(
 
 cc_library(
     name = "allelecounter",
-    srcs = ["allelecounter.cc"],
-    hdrs = ["allelecounter.h"],
+    srcs = [
+        "allelecounter.cc",
+        "gvcf_blocks.cc",
+    ],
+    hdrs = [
+        "allelecounter.h",
+        "gvcf_blocks.h",
+    ],
     deps = [
+        "//third_party/nucleus/protos:struct_cc_pb2",
+        "//third_party/nucleus/protos:variants_cc_pb2",
         ":utils",
         "//deepvariant/channels:base_methylation_channel",
         "//deepvariant/protos:deepvariant_cc_pb2",
