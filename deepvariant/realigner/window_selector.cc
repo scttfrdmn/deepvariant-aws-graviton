@@ -110,7 +110,15 @@ std::vector<int> VariantReadsWindowSelectorCandidates(
   // the number of reads supporting the allele.
   const std::vector<AlleleCount>& counts = allele_counter.Counts();
   for (int i = 0; i < counts.size(); ++i) {
-    auto alt_alleles = SelectAltAlleles(counts[i], config);
+    // Counts-only counters (#10): the same SelectAltAlleles from records.
+    std::vector<Allele> alt_alleles;
+    if (allele_counter.light()) {
+      const int total = allele_counter.LightTotalAlleleCounts(i);
+      for (const auto& allele : allele_counter.LightSumAlleleCounts(i))
+        if (AlleleFilter(allele, total, config)) alt_alleles.push_back(allele);
+    } else {
+      alt_alleles = SelectAltAlleles(counts[i], config);
+    }
     for (const auto& allele : alt_alleles) {
       int start = 0;
       int end = 0;

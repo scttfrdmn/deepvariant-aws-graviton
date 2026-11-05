@@ -513,6 +513,12 @@ void AlleleCounter::AddReadAlleles(const Read& read, absl::string_view sample,
       (options_.track_ref_reads() &&
      std::binary_search(candidate_positions_.begin(),
                         candidate_positions_.end(), to_add_i.position()))) {
+      if (light_) {
+        int key_id = -1;
+        AddLight(to_add_i.position(), read, to_add_i.type(),
+                 to_add_i.is_low_quality(), to_add_i.bases(), &key_id);
+        continue;
+      }
       auto* read_alleles = allele_count.mutable_read_alleles();
       auto* sample_alleles = allele_count.mutable_sample_alleles();
       const string key = ReadKey(read);
@@ -550,6 +556,7 @@ void AlleleCounter::AddReadAllelesFast(const Read& read,
                                        absl::Span<const ReadAllele> indels) {
   string key, sample_key;
   bool have_keys = false;
+  int light_key = -1;
   for (size_t i = 0; i < to_add.size(); ++i) {
     const FastAllele& a = to_add[i];
     // ReadAllele::skip() is position == -1.
@@ -567,6 +574,13 @@ void AlleleCounter::AddReadAllelesFast(const Read& read,
         (options_.track_ref_reads() &&
          std::binary_search(candidate_positions_.begin(),
                             candidate_positions_.end(), a.position))) {
+      if (light_) {
+        AddLight(a.position, read, a.type, a.is_low_quality,
+                 a.indel >= 0 ? absl::string_view(indels[a.indel].bases())
+                              : absl::string_view(&a.base, 1),
+                 &light_key);
+        continue;
+      }
       if (!have_keys) {
         key = ReadKey(read);
         sample_key = std::string(sample);
@@ -1038,6 +1052,85 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
 
   AddReadAllelesFast(read, sample, to_add, indels);
   ++n_reads_counted_;
+}
+
+void AlleleCounter::AddLight(int pos, const Read& read, AlleleType type,
+                             bool low_q, absl::string_view bases, int* key_id) {
+  if (*key_id < 0) {
+    auto [it, inserted] = light_keys_.try_emplace(
+        ReadKey(read), static_cast<int>(light_keys_.size()));
+    *key_id = it->second;
+  }
+  LightRec r{pos, *key_id, type, low_q, -1, static_cast<int>(bases.size()),
+             bases.empty() ? '\0' : bases[0]};
+  if (bases.size() != 1) {
+    r.boff = static_cast<int>(light_bases_.size());
+    light_bases_.append(bases.data(), bases.size());
+  }
+  light_recs_.push_back(r);
+  light_grouped_ = false;
+}
+
+void AlleleCounter::LightGroup() const {
+  if (light_grouped_) return;
+  // Stable counting sort of record indices by position (insertion order kept
+  // within a position, which is what last-write-wins needs).
+  const int n = static_cast<int>(counts_.size());
+  light_start_.assign(n + 1, 0);
+  for (const LightRec& r : light_recs_) light_start_[r.pos + 1]++;
+  for (int i = 0; i < n; ++i) light_start_[i + 1] += light_start_[i];
+  light_order_.assign(light_recs_.size(), 0);
+  std::vector<int> fill(light_start_.begin(), light_start_.end() - 1);
+  for (int j = 0; j < static_cast<int>(light_recs_.size()); ++j)
+    light_order_[fill[light_recs_[j].pos]++] = j;
+  light_grouped_ = true;
+}
+
+std::vector<Allele> AlleleCounter::LightSumAlleleCounts(
+    int i, bool include_low_quality) const {
+  LightGroup();
+  const int b = light_start_[i], e = light_start_[i + 1];
+  std::map<std::pair<string_view, AlleleType>, int> allele_sums;
+  for (int x = b; x < e; ++x) {
+    const LightRec& r = light_recs_[light_order_[x]];
+    // A later record for the same key at this position overwrites this one.
+    bool superseded = false;
+    for (int y = x + 1; y < e; ++y)
+      if (light_recs_[light_order_[y]].key == r.key) { superseded = true; break; }
+    if (superseded) continue;
+    if (include_low_quality || !r.low_q) {
+      const string_view bases =
+          r.boff < 0 ? string_view(&r.base, 1)
+                     : string_view(light_bases_).substr(r.boff, r.blen);
+      ++allele_sums[{bases, r.type}];
+    }
+  }
+  std::vector<Allele> to_return;
+  to_return.reserve(allele_sums.size() + 1);
+  for (const auto& entry : allele_sums)
+    to_return.push_back(MakeAllele(entry.first.first, entry.first.second, entry.second));
+  const AlleleCount& allele_count = counts_[i];
+  if (allele_count.ref_supporting_read_count() > 0 &&
+      !allele_count.track_ref_reads()) {
+    to_return.push_back(MakeAllele(allele_count.ref_base(), AlleleType::REFERENCE,
+                                   allele_count.ref_supporting_read_count()));
+  }
+  return to_return;
+}
+
+int AlleleCounter::LightTotalAlleleCounts(int i, bool include_low_quality) const {
+  LightGroup();
+  const int b = light_start_[i], e = light_start_[i + 1];
+  int total = 0;
+  for (int x = b; x < e; ++x) {
+    const LightRec& r = light_recs_[light_order_[x]];
+    bool superseded = false;
+    for (int y = x + 1; y < e; ++y)
+      if (light_recs_[light_order_[y]].key == r.key) { superseded = true; break; }
+    if (superseded) continue;
+    if ((!r.low_q || include_low_quality) && r.type != AlleleType::REFERENCE) ++total;
+  }
+  return total + counts_[i].ref_supporting_read_count();
 }
 
 string AlleleCounter::ReadKey(const Read& read) {

@@ -91,6 +91,7 @@ PYBIND11_MODULE(allelecounter, m) {
              return py::make_tuple(ret0, ret1);
            })
       .def("summary_counts", &AlleleCounter::SummaryCounts)
+      .def("set_light_mode", &AlleleCounter::SetLightMode, py::arg("light"))
       .def("counts", &AlleleCounter::Counts);
 
   // gVCF blocks in C++ (deepvariant-aws-graviton): see gvcf_blocks.h.

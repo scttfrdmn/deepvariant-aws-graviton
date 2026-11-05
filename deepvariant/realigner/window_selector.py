@@ -28,12 +28,31 @@
 # POSSIBILITY OF SUCH DAMAGE.
 """Determine genomic ranges to perform local assembly."""
 
+import atexit
+import os
+import sys
+
 from third_party.nucleus.protos import reads_pb2
 from third_party.nucleus.util import ranges
 from deepvariant.protos import deepvariant_pb2
 from deepvariant.protos import realigner_pb2
 from deepvariant.python import allelecounter
 from deepvariant.realigner.python import window_selector as cpp_window_selector
+
+
+_WS_SELFCHECK = [0, 0]
+
+
+def _ws_selfcheck_report():
+  if _WS_SELFCHECK[0]:
+    print(
+        'DV_WS_SELFCHECK regions %d mismatched %d' % tuple(_WS_SELFCHECK),
+        file=sys.stderr,
+    )
+
+
+if os.environ.get('DV_WS_SELFCHECK'):
+  atexit.register(_ws_selfcheck_report)
 
 
 def _candidates_from_reads(config, ref_reader, reads, region):
@@ -67,15 +86,35 @@ def _candidates_from_reads(config, ref_reader, reads, region):
   allele_counter = allelecounter.AlleleCounter(ref_reader.c_reader,
                                                expanded_region, [],
                                                allele_counter_options)
+  # Counts-only counter for the VARIANT_READS model, which reads per-allele
+  # totals only (deepvariant-aws-graviton#10). DV_WS_LIGHT=0 turns it off.
+  light = (
+      config.window_selector_model.model_type
+      == realigner_pb2.WindowSelectorModel.VARIANT_READS
+      and os.environ.get('DV_WS_LIGHT', '1') != '0'
+  )
+  if light:
+    allele_counter.set_light_mode(True)
 
   for read in reads:
     allele_counter.add(read, 'placeholder_sample_id')
 
   model_type = config.window_selector_model.model_type
   if model_type == realigner_pb2.WindowSelectorModel.VARIANT_READS:
-    return _variant_reads_threshold_selector(
+    result = _variant_reads_threshold_selector(
         allele_counter, config, expanded_region
     )
+    if os.environ.get('DV_WS_SELFCHECK') and light:
+      # Same windows from a full (map-based) counter? (#10)
+      full = allelecounter.AlleleCounter(ref_reader.c_reader, expanded_region,
+                                         [], allele_counter_options)
+      for read in reads:
+        full.add(read, 'placeholder_sample_id')
+      expected = _variant_reads_threshold_selector(full, config, expanded_region)
+      _WS_SELFCHECK[0] += 1
+      if expected != result:
+        _WS_SELFCHECK[1] += 1
+    return result
   elif model_type == realigner_pb2.WindowSelectorModel.ALLELE_COUNT_LINEAR:
     return _allele_count_linear_selector(
         allele_counter, config, expanded_region

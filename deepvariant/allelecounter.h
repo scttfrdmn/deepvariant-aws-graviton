@@ -49,6 +49,7 @@ friend class test_case_name##_##test_name##_Test
 #include <vector>
 
 #include "deepvariant/protos/deepvariant.pb.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "third_party/nucleus/io/reference.h"
@@ -361,6 +362,20 @@ class AlleleCounter {
   // to Add*() will fail.
   const std::vector<AlleleCount>& Counts() const { return counts_; }
 
+  // Counts-only mode (deepvariant-aws-graviton#10). Read alleles are kept as
+  // plain records instead of read_alleles / sample_alleles map entries, for
+  // counters whose consumers only need per-allele totals (the window
+  // selector's VARIANT_READS model). Set before adding reads. In this mode the
+  // AlleleCount protos carry ref_supporting_read_count but no read_alleles;
+  // LightSumAlleleCounts / LightTotalAlleleCounts return exactly what
+  // SumAlleleCounts / TotalAlleleCounts would on the full protos, including the
+  // map's last-write-wins rule for a read key seen twice at one position.
+  void SetLightMode(bool light) { light_ = light; }
+  bool light() const { return light_; }
+  std::vector<Allele> LightSumAlleleCounts(int i,
+                                           bool include_low_quality = false) const;
+  int LightTotalAlleleCounts(int i, bool include_low_quality = false) const;
+
   // Gets the mutable vector of AlleleCounts over this counter's interval.
   //
   // This function returns a mutable vector of AlleleCount objects, one for each
@@ -514,6 +529,26 @@ class AlleleCounter {
 
   // Our AlleleCount objects, one for each base in our interval, in order.
   std::vector<AlleleCount> counts_;
+
+  // Counts-only mode storage.
+  struct LightRec {
+    int pos;
+    int key;
+    AlleleType type;
+    bool low_q;
+    int boff;   // bases: offset into light_bases_, or -1 for the single base
+    int blen;
+    char base;
+  };
+  void AddLight(int pos, const nucleus::genomics::v1::Read& read, AlleleType type, bool low_q,
+                absl::string_view bases, int* key_id);
+  void LightGroup() const;
+  bool light_ = false;
+  std::vector<LightRec> light_recs_;
+  std::string light_bases_;
+  absl::flat_hash_map<std::string, int> light_keys_;
+  mutable bool light_grouped_ = false;
+  mutable std::vector<int> light_start_, light_order_;
 
   // The reference bases covering our interval;
   const string ref_bases_;
