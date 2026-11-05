@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "src/ssw_cpp.h"
 
@@ -65,9 +66,11 @@ class Aligner : public StripedSmithWaterman::Aligner {
 
   int SetReferenceSequence(const string& reference);
 
-  int Align(const string& query, const Filter& filter, int maskLen,
-            Alignment* alignment)
-      const;
+  int Align(const string& query, const Filter& filter, int maskLen, Alignment* alignment) const;
+  // Align for each query against the current reference, batched (#9).
+  void AlignBatch(const std::vector<string>& queries, const Filter& filter,
+                  int maskLen, std::vector<Alignment>* alignments,
+                  std::vector<uint16_t>* flags) const;
 };
 
 

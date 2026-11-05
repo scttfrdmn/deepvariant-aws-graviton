@@ -38,6 +38,10 @@ http_archive(
     urls = [
         "https://github.com/mengyao/Complete-Striped-Smith-Waterman-Library/archive/v1.2.5.tar.gz",
     ],
+    # deepvariant-aws-graviton#9: prefix-scan AVX-512BW Smith-Waterman (exact
+    # on DeepVariant's outputs) and batched alignment against one reference.
+    patches = ["//:third_party/libssw-scan.patch"],
+    patch_args = ["-p1"],
 )
 
 http_archive(

@@ -1,0 +1,351 @@
+--- a/src/ssw.c	2026-11-05 10:45:59
++++ b/src/ssw.c	2026-11-05 10:45:59
+@@ -786,11 +786,29 @@
+ 	return reverse;
+ }
+ 
++/* The scan kernel (below) unless SSW_KERNEL=sse2. */
++static int ssw_use_scan(void) {
++#if defined(__AVX512BW__)
++	static int use_scan = -1;
++	if (use_scan < 0) { const char* k = getenv("SSW_KERNEL"); use_scan = !(k && strcmp(k, "sse2") == 0); }
++	return use_scan;
++#else
++	return 0;
++#endif
++}
++
+ s_profile* ssw_init (const int8_t* read, const int32_t readLen, const int8_t* mat, const int32_t n, const int8_t score_size) {
+ 	s_profile* p = (s_profile*)calloc(1, sizeof(struct _profile));
+ 	p->profile_byte = 0;
+ 	p->profile_word = 0;
+ 	p->bias = 0;
++	if (ssw_use_scan()) {	/* sw_scan16 builds its own profile from read and mat */
++		p->read = read;
++		p->mat = mat;
++		p->readLen = readLen;
++		p->n = n;
++		return p;
++	}
+ 
+ 	if (score_size == 0 || score_size == 2) {
+ 		/* Find the bias to use in the substitution matrix */
+@@ -815,6 +833,202 @@
+ 	free(p);
+ }
+ 
++
++/* ---------------------------------------------------------------------------
++ * Scan Smith-Waterman (deepvariant-aws-graviton#9): Gotoh local alignment in
++ * 16 bits, 32 lanes (AVX-512BW), striped (element j = lane * S + seg), with F
++ * from a two-pass prefix scan instead of SSW's lazy-F loop. Same outputs as
++ * sw_sse2_byte/word: score, end_ref = first column in iteration order where
++ * the running max strictly increases, end_read = smallest query index with
++ * H == max in that column, terminate on column max. No 2nd best. SSW's lazy-F
++ * leaves E un-updated after a correction; this computes true Gotoh, so the two
++ * can differ only where that fires (the replay gate decides). Selected unless
++ * SSW_KERNEL=sse2.
++ * ------------------------------------------------------------------------- */
++#if defined(__AVX512BW__)
++#include <immintrin.h>
++
++static inline uint16_t hmax_epu16_512(__m512i v) {
++	__m256i a = _mm256_max_epu16(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
++	__m128i b = _mm_max_epu16(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
++	b = _mm_xor_si128(b, _mm_set1_epi32(-1));
++	return (uint16_t)(0xffff - _mm_extract_epi16(_mm_minpos_epu16(b), 0));
++}
++
++static alignment_end* sw_scan16 (const int8_t* ref, int8_t ref_dir, int32_t refLen,
++		const int8_t* read, int32_t readLen, const int8_t* mat, int32_t n,
++		const uint8_t weight_gapO, const uint8_t weight_gapE,
++		uint16_t terminate, int32_t maskLen) {
++	const int32_t S = (readLen + 31) / 32;
++	int32_t i, j, seg, l, nt;
++	/* Per-thread scratch, grown as needed: profile (n * S) + 5 state arrays (S). */
++	static __thread __m512i* scratch = 0;
++	static __thread size_t scratch_cap = 0;
++	size_t need = (size_t)(n + 5) * S;	/* profile, 3 H buffers, E, FL */
++	if (need > scratch_cap) {
++		free(scratch);
++		scratch_cap = need * 2;
++		scratch = (__m512i*) aligned_alloc(64, scratch_cap * 64);
++	}
++	__m512i* P = scratch;
++	{
++		/* Striped query (element j = lane * S + seg), padded with code n -> score 0. */
++		uint8_t q[32 * 64 + 32];
++		uint8_t* qs = (S <= 64) ? q : (uint8_t*) malloc((size_t)32 * S);
++		for (seg = 0; seg < S; ++seg)
++			for (l = 0; l < 32; ++l) {
++				j = l * S + seg;
++				qs[seg * 32 + l] = (uint8_t)(j < readLen ? read[j] : n);
++			}
++		int16_t row[33];
++		int16_t* t = (int16_t*) P;
++		for (nt = 0; nt < n; ++nt) {
++			for (j = 0; j < n; ++j) row[j] = mat[nt * n + j];
++			row[n] = 0;
++			for (j = 0; j < 32 * S; ++j) *t++ = row[qs[j]];
++		}
++		if (qs != q) free(qs);
++	}
++	size_t vb = (size_t)S * 64;
++	/* Three H buffers rotate: previous column, current column, and the column
++	 * where the max last increased (kept for end_read, no copy). */
++	__m512i* Hb[3] = { P + (size_t)n * S, P + (size_t)(n + 1) * S, P + (size_t)(n + 2) * S };
++	__m512i* E = P + (size_t)(n + 3) * S;
++	__m512i* FL = P + (size_t)(n + 4) * S;
++	int hp = 0, hc = 1, hs = 2;
++	__m512i* H = Hb[hp];
++	__m512i* Hn = Hb[hc];
++	memset(H, 0, vb); memset(E, 0, vb); memset(Hb[hs], 0, vb);
++	uint16_t max = 0;
++	int32_t end_ref = 0, end_read = readLen - 1;
++	const __m512i vGapO = _mm512_set1_epi16(weight_gapO), vGapE = _mm512_set1_epi16(weight_gapE);
++	const __m512i vTerm = _mm512_set1_epi16((int16_t)terminate);
++	__m512i idx[5], dec[5];
++	__mmask32 msk[5];
++	for (l = 0; l < 5; ++l) {
++		int d = 1 << l;
++		int16_t ix[32];
++		for (j = 0; j < 32; ++j) ix[j] = (int16_t)(j >= d ? j - d : 0);
++		idx[l] = _mm512_loadu_si512(ix);
++		msk[l] = (__mmask32)(0xffffffffu << d);
++		long dd = (long) d * S * weight_gapE;
++		dec[l] = _mm512_set1_epi16((int16_t)(dd > 65535 ? 65535 : dd));
++	}
++	int32_t begin = 0, end = refLen, step = 1;
++	if (ref_dir == 1) { begin = refLen - 1; end = -1; step = -1; }
++	for (i = begin; LIKELY(i != end); i += step) {
++		const __m512i* vP = P + ref[i] * S;
++		/* Pass 1: H' = max(diag + s, E); F within each lane from a zero carry. */
++		__m512i diag = _mm512_maskz_permutexvar_epi16(msk[0], idx[0], H[S - 1]);
++		__m512i fl = _mm512_setzero_si512();
++		for (seg = 0; seg < S; ++seg) {
++			__m512i h = _mm512_max_epi16(_mm512_adds_epi16(diag, vP[seg]), E[seg]);
++			Hn[seg] = h;
++			FL[seg] = fl;
++			fl = _mm512_max_epu16(_mm512_subs_epu16(fl, vGapE), _mm512_subs_epu16(h, vGapO));
++			diag = H[seg];
++		}
++		/* Carry into each lane: decayed prefix max of the previous lanes' exits. */
++		__m512i c = _mm512_maskz_permutexvar_epi16(msk[0], idx[0], fl);
++		for (l = 0; l < 5; ++l)
++				c = _mm512_max_epu16(c, _mm512_subs_epu16(_mm512_maskz_permutexvar_epi16(msk[l], idx[l], c), dec[l]));
++		/* Pass 2: F = max(local, carry decayed by seg); H = max(H', F); E for the next column. */
++		__m512i vMaxColumn = _mm512_setzero_si512();
++		for (seg = 0; seg < S; ++seg) {
++			__m512i h = _mm512_max_epi16(Hn[seg], _mm512_max_epu16(FL[seg], c));
++			Hn[seg] = h;
++			vMaxColumn = _mm512_max_epu16(vMaxColumn, h);
++			E[seg] = _mm512_max_epu16(_mm512_subs_epu16(E[seg], vGapE), _mm512_subs_epu16(h, vGapO));
++			c = _mm512_subs_epu16(c, vGapE);
++		}
++		/* Column max > running max iff some lane exceeds it; reduce only then. */
++		if (UNLIKELY(_mm512_cmpgt_epu16_mask(vMaxColumn, _mm512_set1_epi16((int16_t)max)))) {
++			max = hmax_epu16_512(vMaxColumn);
++			end_ref = i;
++			hs = hc;
++		}
++		{	/* current becomes previous; next current is the buffer that is neither */
++			int np = hc, nc = 3 - np - (hs == np ? hp : hs);
++			if (nc == np || nc == hs) nc = 3 - np - hs;
++			hp = np; hc = nc;
++			H = Hb[hp]; Hn = Hb[hc];
++		}
++		/* Column maxima never exceed terminate (score1), so == is any lane equal. */
++		if (_mm512_cmpeq_epi16_mask(vMaxColumn, vTerm)) break;
++	}
++	for (seg = 0; seg < S; ++seg) {
++		__mmask32 m = _mm512_cmpeq_epi16_mask(Hb[hs][seg], _mm512_set1_epi16((int16_t)max));
++		if (m) {
++			int32_t t = __builtin_ctz(m) * S + seg;
++			if (t < end_read) end_read = t;
++		}
++	}
++	alignment_end* bests = (alignment_end*) calloc(2, sizeof(alignment_end));
++	bests[0].score = max;
++	bests[0].ref = end_ref;
++	bests[0].read = end_read;
++	/* No 2nd-best (score2, ref_end2): DeepVariant reads only sw_score,
++	 * cigar_string and ref_begin from the alignment. */
++	(void) maskLen;
++	return bests;
++}
++
++/* ssw_align with every pass on sw_scan16. */
++static s_align* ssw_align_scan (const s_profile* prof, const int8_t* ref, int32_t refLen,
++		const uint8_t weight_gapO, const uint8_t weight_gapE, const uint8_t flag,
++		const uint16_t filters, const int32_t filterd, const int32_t maskLen) {
++	alignment_end* bests, *bests_reverse;
++	int32_t band_width = 0, readLen = prof->readLen;
++	int8_t* read_reverse = 0;
++	cigar* path;
++	s_align* r = (s_align*)calloc(1, sizeof(s_align));
++	r->ref_begin1 = -1;
++	r->read_begin1 = -1;
++	r->cigar = 0;
++	r->cigarLen = 0;
++	r->flag = 0;
++	if (maskLen < 15) {
++		fprintf(stderr, "When maskLen < 15, the function ssw_align doesn't return 2nd best alignment information.\n");
++	}
++	bests = sw_scan16(ref, 0, refLen, prof->read, readLen, prof->mat, prof->n, weight_gapO, weight_gapE, (uint16_t)-1, maskLen);
++	r->score1 = bests[0].score;
++	r->ref_end1 = bests[0].ref;
++	r->read_end1 = bests[0].read;
++	if (maskLen >= 15) {
++		r->score2 = bests[1].score;
++		r->ref_end2 = bests[1].ref;
++	} else {
++		r->score2 = 0;
++		r->ref_end2 = -1;
++	}
++	free(bests);
++	if (flag == 0 || (flag == 2 && r->score1 < filters)) goto end;
++	read_reverse = seq_reverse(prof->read, r->read_end1);
++	bests_reverse = sw_scan16(ref, 1, r->ref_end1 + 1, read_reverse, r->read_end1 + 1, prof->mat, prof->n, weight_gapO, weight_gapE, r->score1, maskLen);
++	free(read_reverse);
++	r->ref_begin1 = bests_reverse[0].ref;
++	r->read_begin1 = r->read_end1 - bests_reverse[0].read;
++	if (UNLIKELY(r->score1 > bests_reverse[0].score)) {
++		fprintf(stderr, "Warning: The alignment path of one pair of sequences may miss a small part. [ssw.c ssw_align]\n");
++		r->flag = 2;
++	}
++	free(bests_reverse);
++	if ((7&flag) == 0 || ((2&flag) != 0 && r->score1 < filters) || ((4&flag) != 0 && (r->ref_end1 - r->ref_begin1 > filterd || r->read_end1 - r->read_begin1 > filterd))) goto end;
++	refLen = r->ref_end1 - r->ref_begin1 + 1;
++	readLen = r->read_end1 - r->read_begin1 + 1;
++	band_width = abs(refLen - readLen) + 1;
++	path = banded_sw(ref + r->ref_begin1, prof->read + r->read_begin1, refLen, readLen, r->score1, weight_gapO, weight_gapE, band_width, prof->mat, prof->n);
++	if (path == 0) r->flag = 1;
++	else {
++		r->cigar = path->seq;
++		r->cigarLen = path->length;
++		free(path);
++	}
++end:
++	return r;
++}
++#endif
++
+ s_align* ssw_align (const s_profile* prof,
+ 					const int8_t* ref,
+ 				  	int32_t refLen,
+@@ -825,6 +1039,9 @@
+ 					const int32_t filterd,
+ 					const int32_t maskLen) {
+ 
++#if defined(__AVX512BW__)
++	if (ssw_use_scan()) return ssw_align_scan(prof, ref, refLen, weight_gapO, weight_gapE, flag, filters, filterd, maskLen);
++#endif
+ 	alignment_end* bests = 0, *bests_reverse = 0;
+ 	__m128i* vP = 0;
+ 	int32_t word = 0, band_width = 0, readLen = prof->readLen;
+@@ -1016,5 +1233,25 @@
+ 	free(*cigar);
+ 	(*cigar) = new_cigar;
+ 	return mismatch_length;
++}
++
++
++/* ssw_align for n profiles (from ssw_init with score_size 2) against one
++ * reference (deepvariant-aws-graviton#9). out[t] equals ssw_align(profs[t],
++ * ref, ...) for every t; with AVX-512BW every pass runs on sw_scan16 unless
++ * SSW_KERNEL=sse2. */
++void ssw_align_batch (const s_profile* const* profs, int32_t n,
++		const int8_t* ref, int32_t refLen,
++		const uint8_t weight_gapO, const uint8_t weight_gapE, const uint8_t flag,
++		const uint16_t filters, const int32_t filterd, const int32_t maskLen,
++		s_align** out) {
++	int32_t t;
++#if defined(__AVX512BW__)
++	if (ssw_use_scan()) {
++		for (t = 0; t < n; ++t) out[t] = ssw_align_scan(profs[t], ref, refLen, weight_gapO, weight_gapE, flag, filters, filterd, maskLen);
++		return;
++	}
++#endif
++	for (t = 0; t < n; ++t) out[t] = ssw_align(profs[t], ref, refLen, weight_gapO, weight_gapE, flag, filters, filterd, maskLen);
+ }
+ 
+diff --color -ruN a/src/ssw.h b/src/ssw.h
+--- a/src/ssw.h	2026-11-05 10:45:59
++++ b/src/ssw.h	2026-11-05 10:45:59
+@@ -138,6 +138,12 @@
+ */
+ void align_destroy (s_align* a);
+ 
++/* ssw_align for n profiles against one reference; out[t] == ssw_align(profs[t], ...). */
++void ssw_align_batch (const s_profile* const* profs, int32_t n, const int8_t* ref, int32_t refLen,
++		const uint8_t weight_gapO, const uint8_t weight_gapE, const uint8_t flag,
++		const uint16_t filters, const int32_t filterd, const int32_t maskLen, s_align** out);
++
++
+ /*! @function:
+      1. Calculate the number of mismatches.
+      2. Modify the cigar string:
+diff --color -ruN a/src/ssw_cpp.cpp b/src/ssw_cpp.cpp
+--- a/src/ssw_cpp.cpp	2026-11-05 10:45:59
++++ b/src/ssw_cpp.cpp	2026-11-05 10:45:59
+@@ -469,3 +469,44 @@
+   translation_matrix_ = NULL;
+ }
+ } // namespace StripedSmithWaterman
++
++namespace StripedSmithWaterman {
++void Aligner::AlignBatch(const std::vector<std::string>& queries, const Filter& filter,
++                         const int32_t maskLen, std::vector<Alignment>* alignments,
++                         std::vector<uint16_t>* flags) const {
++  const size_t n = queries.size();
++  alignments->assign(n, Alignment());
++  flags->assign(n, 0);
++  if (!translation_matrix_ || reference_length_ == 0) return;  // Align returns false (0)
++  std::vector<int8_t*> tq(n, nullptr);
++  std::vector<const s_profile*> profs;
++  std::vector<size_t> idx;
++  for (size_t t = 0; t < n; ++t) {
++    int query_len = strlen(queries[t].c_str());
++    if (query_len == 0) continue;  // Align returns false (0), alignment untouched
++    tq[t] = new int8_t[query_len];
++    TranslateBase(queries[t].c_str(), query_len, tq[t]);
++    profs.push_back(ssw_init(tq[t], query_len, score_matrix_, score_matrix_size_, 2));
++    idx.push_back(t);
++  }
++  uint8_t flag = 0;
++  SetFlag(filter, &flag);
++  std::vector<s_align*> res(profs.size());
++  if (!profs.empty())
++    ssw_align_batch(profs.data(), profs.size(), translated_reference_, reference_length_,
++                    static_cast<int>(gap_opening_penalty_), static_cast<int>(gap_extending_penalty_),
++                    flag, filter.score_filter, filter.distance_filter, maskLen, res.data());
++  for (size_t u = 0; u < profs.size(); ++u) {
++    size_t t = idx[u];
++    int query_len = strlen(queries[t].c_str());
++    Alignment* a = &(*alignments)[t];
++    a->Clear();
++    ConvertAlignment(*res[u], query_len, a);
++    a->mismatches = CalculateNumberMismatch(a, translated_reference_, tq[t], query_len);
++    (*flags)[t] = res[u]->flag;
++    align_destroy(res[u]);
++    init_destroy(const_cast<s_profile*>(profs[u]));
++  }
++  for (size_t t = 0; t < n; ++t) delete[] tq[t];
++}
++}  // namespace StripedSmithWaterman
+diff --color -ruN a/src/ssw_cpp.h b/src/ssw_cpp.h
+--- a/src/ssw_cpp.h	2026-11-05 10:45:59
++++ b/src/ssw_cpp.h	2026-11-05 10:45:59
+@@ -137,6 +137,12 @@
+   // @return   If the alignment path is accurate (or has missing part). 0: accurate; 1: banded_sw is totally failed; 2: banded_sw returned path has missing part
+   // =========
+   uint16_t Align(const char* query, const Filter& filter, Alignment* alignment, const int32_t maskLen) const;
++  // Align(queries[t], ...) for every t against the reference set by
++  // SetReferenceSequence, batched; flags[t] and (*alignments)[t] are what
++  // Align would return and fill. (deepvariant-aws-graviton#9)
++  void AlignBatch(const std::vector<std::string>& queries, const Filter& filter,
++                  const int32_t maskLen, std::vector<Alignment>* alignments,
++                  std::vector<uint16_t>* flags) const;
+ 
+   // =========
+   // @function Align the query againt the reference.

@@ -73,6 +73,16 @@ int Aligner::Align(const string& query, const Filter& filter, int maskLen,
       query.c_str(), filter, alignment, maskLen);
 }
 
+void Aligner::AlignBatch(const std::vector<string>& queries, const Filter& filter,
+                         int maskLen, std::vector<Alignment>* alignments,
+                         std::vector<uint16_t>* flags) const {
+  std::vector<StripedSmithWaterman::Alignment> a;
+  StripedSmithWaterman::Aligner::AlignBatch(queries, filter, maskLen, &a, flags);
+  alignments->resize(a.size());
+  for (size_t i = 0; i < a.size(); ++i)
+    static_cast<StripedSmithWaterman::Alignment&>((*alignments)[i]) = a[i];
+}
+
 }  // namespace deepvariant
 }  // namespace genomics
 }  // namespace learning

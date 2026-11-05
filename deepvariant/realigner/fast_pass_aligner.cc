@@ -31,6 +31,8 @@
 
 #include "deepvariant/realigner/fast_pass_aligner.h"
 
+#include <immintrin.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +58,9 @@
 namespace learning {
 namespace genomics {
 namespace deepvariant {
+
+// FPA_STOCK=1 selects the upstream code paths changed for #9 (A/B).
+static const bool kFpaStock = getenv("FPA_STOCK") != nullptr;
 
 void FastPassAligner::set_reference(absl::string_view reference) {
   this->reference_ = reference;
@@ -198,6 +203,24 @@ Alignment FastPassAligner::SswAlign(const string& target) const {
   }
 }
 
+static const bool kSswBatch = getenv("FPA_NOBATCH") == nullptr;
+
+std::vector<Alignment> FastPassAligner::SswAlignBatch(
+    const std::vector<string>& targets) const {
+  CHECK(ssw_aligner_);
+  Filter filter;
+  std::vector<Alignment> out;
+  std::vector<uint16_t> flags;
+  ssw_aligner_->AlignBatch(targets, filter, read_size_, &out, &flags);
+  for (size_t t = 0; t < targets.size(); ++t) {
+    if (flags[t] != 0) {
+      LOG(WARNING) << "SSW alignment failed for query: '" << targets[t] << "'";
+      out[t] = Alignment();
+    }
+  }
+  return out;
+}
+
 // For each haplotype try to find all reads that can be aligned using index.
 void FastPassAligner::FastAlignReadsToHaplotypes() {
   std::vector<ReadAlignment> read_alignment_scores(reads_.size());
@@ -235,15 +258,28 @@ void FastPassAligner::FastAlignReadsToHaplotype(
   // In the loop we try to align reads for each position in haplotype up to
   // lastPos.
   int lastPos = haplotype.length() - kmer_size_;
+  if (flat_index_) KmerCodes(haplotype, &hap_codes_, &hap_valid_);
   for (int i = 0; i <= lastPos; i++) {
     // get all reads that are aligned against i-th position
-    auto index_it = kmer_index_.find(haplotype.substr(i, kmer_size_));
-    if (index_it == kmer_index_.end()) {
-      continue;
+    const KmerOccurrence* occ_begin;
+    const KmerOccurrence* occ_end;
+    if (flat_index_) {
+      const int64_t uid = FlatKmerUid(haplotype, i, hap_codes_[i], hap_valid_[i]);
+      if (uid < 0) continue;
+      occ_begin = kmer_occ_.data() + kmer_start_[uid];
+      occ_end = kmer_occ_.data() + kmer_start_[uid + 1];
+    } else {
+      auto index_it = kmer_index_.find(haplotype.substr(i, kmer_size_));
+      if (index_it == kmer_index_.end()) {
+        continue;
+      }
+      occ_begin = index_it->second.data();
+      occ_end = occ_begin + index_it->second.size();
     }
     // Iterate through all the reads that are found in the index for the current
     // kmer.
-    for (const auto& it : index_it->second) {
+    for (const KmerOccurrence* itp = occ_begin; itp != occ_end; ++itp) {
+      const auto& it = *itp;
       uint64_t read_id_index = static_cast<uint64_t>(it.read_id);
       CHECK(read_id_index < reads_.size() && it.read_id.is_set);
       size_t target_start_pos = std::max(
@@ -300,11 +336,46 @@ void FastPassAligner::FastAlignReadsToHaplotype(
   }    // for (all k-mer positions)
 }
 
+// Mismatches between equal-length strings, where a position with 'N' on
+// either side is not a mismatch; AVX-512BW, 64 bytes per step (#9).
+__attribute__((target("avx512bw"))) static int CountMismatchesAvx512(
+    const char* a, const char* b, size_t n) {
+  const __m512i vn = _mm512_set1_epi8('N');
+  int mm = 0;
+  for (size_t i = 0; i < n; i += 64) {
+    const __mmask64 lm = n - i >= 64 ? ~0ULL : ((1ULL << (n - i)) - 1);
+    const __m512i x = _mm512_maskz_loadu_epi8(lm, a + i);
+    const __m512i y = _mm512_maskz_loadu_epi8(lm, b + i);
+    __mmask64 d = _mm512_mask_cmpneq_epi8_mask(lm, x, y);
+    d &= ~_mm512_cmpeq_epi8_mask(x, vn) & ~_mm512_cmpeq_epi8_mask(y, vn);
+    mm += __builtin_popcountll(d);
+  }
+  return mm;
+}
+static const bool kHaveAvx512bw = __builtin_cpu_supports("avx512bw");
+
 // Align 2 same length strings by comparing each character.
+//
+// Equivalent to the stock loop below: that loop returns 0 with
+// *num_of_mismatches == max_mismatches as soon as the running count reaches
+// max_mismatches, which happens iff the total count is >= max_mismatches;
+// otherwise every non-mismatch position is a match.
 int FastPassAligner::FastAlignStrings(absl::string_view s1,
                                       absl::string_view s2,
                                       int max_mismatches,
                                       int* num_of_mismatches) const {
+  // max_mismatches <= 0 never exits early in the stock loop; keep it there.
+  if (!kFpaStock && kHaveAvx512bw && max_mismatches > 0) {
+    CHECK(s1.size() == s2.size());
+    const int mm = CountMismatchesAvx512(s1.data(), s2.data(), s1.size());
+    if (mm >= max_mismatches) {
+      *num_of_mismatches = max_mismatches;
+      return 0;
+    }
+    *num_of_mismatches = mm;
+    return (static_cast<int>(s1.size()) - mm) * match_score_ -
+           mm * mismatch_penalty_;
+  }
   int num_of_matches = 0;
   *num_of_mismatches = 0;
   CHECK(s1.size() == s2.size());
@@ -371,6 +442,17 @@ void FastPassAligner::AlignHaplotypesToReference() {
     }
   }
 
+  std::vector<Alignment> batched;
+  size_t next_batched = 0;
+  if (kSswBatch) {
+    std::vector<string> targets;
+    for (auto& haplotype_alignment : read_to_haplotype_alignments_) {
+      CHECK(haplotype_alignment.haplotype_index < haplotypes_.size());
+      if (haplotypes_[haplotype_alignment.haplotype_index] != reference_)
+        targets.push_back(haplotypes_[haplotype_alignment.haplotype_index]);
+    }
+    batched = SswAlignBatch(targets);
+  }
   for (auto& haplotype_alignment : read_to_haplotype_alignments_) {
     Filter filter;
     CHECK(haplotype_alignment.haplotype_index < haplotypes_.size());
@@ -384,7 +466,8 @@ void FastPassAligner::AlignHaplotypesToReference() {
       haplotype_alignment.ref_pos = 0;
     } else {
       Alignment alignment =
-          SswAlign(haplotypes_[haplotype_alignment.haplotype_index]);
+          kSswBatch ? batched[next_batched++]
+                    : SswAlign(haplotypes_[haplotype_alignment.haplotype_index]);
       if (alignment.sw_score > 0) {
         // In rare cases, the ref haplotype will be a substring of the ref, and
         // therefore not caught by the string equality check above.
@@ -400,7 +483,54 @@ void FastPassAligner::AlignHaplotypesToReference() {
   }
 }
 
+// SswAlignReadsToHaplotypes with the alignments grouped by haplotype and
+// batched; each (read, haplotype) result is applied as below (#9).
+void FastPassAligner::SswAlignReadsToHaplotypesBatched(uint16_t score_threshold) {
+  std::vector<bool> needs(reads_.size(), false);
+  for (int i = 0; i < reads_.size(); i++) {
+    bool has_at_least_one_alignment = false;
+    for (const auto& hap_alignment : read_to_haplotype_alignments_) {
+      if (hap_alignment.read_alignment_scores[i].score > 0) {
+        has_at_least_one_alignment = true;
+        break;
+      }
+    }
+    needs[i] = !has_at_least_one_alignment;
+  }
+  for (auto& hap_alignment : read_to_haplotype_alignments_) {
+    if (hap_alignment.haplotype_score == 0 &&
+        !(force_alignment_ && hap_alignment.is_reference)) {
+      continue;
+    }
+    CHECK(hap_alignment.haplotype_index < haplotypes_.size());
+    std::vector<int> ids;
+    std::vector<string> targets;
+    for (int i = 0; i < reads_.size(); i++) {
+      if (needs[i]) { ids.push_back(i); targets.push_back(reads_[i]); }
+    }
+    if (ids.empty()) continue;
+    SswSetReference(haplotypes_[hap_alignment.haplotype_index]);
+    std::vector<Alignment> res = SswAlignBatch(targets);
+    for (size_t u = 0; u < ids.size(); ++u) {
+      const int i = ids[u];
+      const Alignment& alignment = res[u];
+      if (alignment.sw_score > 0) {
+        if (alignment.sw_score >= score_threshold ||
+            (force_alignment_ && hap_alignment.is_reference)) {
+          hap_alignment.read_alignment_scores[i].score = alignment.sw_score;
+          hap_alignment.read_alignment_scores[i].cigar = alignment.cigar_string;
+          hap_alignment.read_alignment_scores[i].position = alignment.ref_begin;
+        }
+      }
+    }
+  }
+}
+
 void FastPassAligner::SswAlignReadsToHaplotypes(uint16_t score_threshold) {
+  if (kSswBatch) {
+    SswAlignReadsToHaplotypesBatched(score_threshold);
+    return;
+  }
   // For each read
   for (int i = 0; i < reads_.size(); i++) {
     bool has_at_least_one_alignment = false;
@@ -607,7 +737,103 @@ void FastPassAligner::AddReadToIndex(absl::string_view read, ReadId read_id) {
   }
 }
 
+namespace {
+// 2-bit codes for A, C, G, T; 4 for any other byte.
+struct BaseCodes {
+  uint8_t v[256];
+  constexpr BaseCodes() : v() {
+    for (int i = 0; i < 256; ++i) v[i] = 4;
+    v['A'] = 0; v['C'] = 1; v['G'] = 2; v['T'] = 3;
+  }
+};
+constexpr BaseCodes kBaseCodes;
+}  // namespace
+
+// codes[i] = 2-bit packing of s[i, i + k); valid[i] = all of it is ACGT.
+void FastPassAligner::KmerCodes(absl::string_view s,
+                                std::vector<uint64_t>* codes,
+                                std::vector<uint8_t>* valid) const {
+  const int k = kmer_size_;
+  codes->clear();
+  valid->clear();
+  if (static_cast<int64_t>(s.size()) < k) return;
+  const size_t n = s.size() - k + 1;
+  codes->resize(n);
+  valid->resize(n);
+  const uint64_t mask = k == 32 ? ~0ULL : ((1ULL << (2 * k)) - 1);
+  uint64_t code = 0;
+  int64_t last_bad = -1;
+  for (size_t j = 0; j < s.size(); ++j) {
+    const uint8_t c = kBaseCodes.v[static_cast<uint8_t>(s[j])];
+    if (c == 4) last_bad = j;
+    code = ((code << 2) | (c & 3)) & mask;
+    if (j + 1 >= static_cast<size_t>(k)) {
+      const size_t i = j + 1 - k;
+      (*codes)[i] = code;
+      (*valid)[i] = last_bad < static_cast<int64_t>(i);
+    }
+  }
+}
+
+int64_t FastPassAligner::FlatKmerUid(absl::string_view s, size_t pos,
+                                     uint64_t code, bool valid) const {
+  if (valid) {
+    auto it = kmer_uid_packed_.find(code);
+    return it == kmer_uid_packed_.end() ? int64_t{-1} : int64_t{it->second};
+  }
+  auto it = kmer_uid_other_.find(s.substr(pos, kmer_size_));
+  return it == kmer_uid_other_.end() ? int64_t{-1} : int64_t{it->second};
+}
+
+void FastPassAligner::BuildFlatIndex() {
+  kmer_uid_packed_.clear();
+  kmer_uid_other_.clear();
+  std::vector<uint32_t> occ_uid;
+  std::vector<KmerOccurrence> occ;
+  size_t total = 0;
+  for (const auto& read : reads_)
+    if (read.length() > kmer_size_) total += read.length() - kmer_size_ + 1;
+  occ_uid.reserve(total);
+  occ.reserve(total);
+  kmer_uid_packed_.reserve(total / 4);
+  uint32_t nuid = 0;
+  std::vector<uint64_t> codes;
+  std::vector<uint8_t> valid;
+  for (size_t read_id = 0; read_id < reads_.size(); ++read_id) {
+    absl::string_view read = reads_[read_id];
+    // As AddReadToIndex: reads not longer than the k-mer are not indexed.
+    if (read.length() <= kmer_size_) continue;
+    KmerCodes(read, &codes, &valid);
+    for (size_t i = 0; i < codes.size(); ++i) {
+      uint32_t uid;
+      if (valid[i]) {
+        auto r = kmer_uid_packed_.try_emplace(codes[i], nuid);
+        if (r.second) ++nuid;
+        uid = r.first->second;
+      } else {
+        auto r = kmer_uid_other_.try_emplace(read.substr(i, kmer_size_), nuid);
+        if (r.second) ++nuid;
+        uid = r.first->second;
+      }
+      occ_uid.push_back(uid);
+      occ.push_back(KmerOccurrence(ReadId(read_id), KmerOffset(i)));
+    }
+  }
+  // Group by uid, keeping insertion order within each (stable counting sort).
+  kmer_start_.assign(nuid + 1, 0);
+  for (uint32_t u : occ_uid) ++kmer_start_[u + 1];
+  for (uint32_t u = 0; u < nuid; ++u) kmer_start_[u + 1] += kmer_start_[u];
+  kmer_occ_.resize(occ.size());
+  std::vector<uint32_t> fill(kmer_start_.begin(), kmer_start_.end() - 1);
+  for (size_t t = 0; t < occ.size(); ++t) kmer_occ_[fill[occ_uid[t]]++] = occ[t];
+  flat_index_ = true;
+}
+
 void FastPassAligner::BuildIndex() {
+  if (!kFpaStock) {
+    BuildFlatIndex();
+    return;
+  }
   size_t read_id = 0;
   for (const auto& read : reads_) {
     AddReadToIndex(read, ReadId(read_id++));
@@ -828,7 +1054,7 @@ std::list<CigarOp> LeftTrimHaplotypeToRefAlignment(
 // MATCH + MATCH = MATCH
 // INS + DEL = Exception!
 // DEL + INS = Exception!
-inline void MergeOneBaseOperations(
+inline void MergeOneBaseOperationsStock(
     const CigarOp& cur_read_to_hap_op,
     const CigarOp& cur_hap_to_ref_op,
     int read_len,
@@ -852,6 +1078,36 @@ inline void MergeOneBaseOperations(
     for (auto op : operations) {
       if (cur_read_to_hap_op.operation == op
           || cur_hap_to_ref_op.operation == op) {
+        MergeCigarOp(CigarOp(op, 1), read_len, read_to_ref_cigar_ops);
+        break;
+      }
+    }
+}
+
+// Same merge without the per-call heap vectors (deepvariant-aws-graviton#9).
+inline void MergeOneBaseOperations(
+    const CigarOp& cur_read_to_hap_op,
+    const CigarOp& cur_hap_to_ref_op,
+    int read_len,
+    std::list<CigarOp>* read_to_ref_cigar_ops) {
+    if (kFpaStock) {
+      MergeOneBaseOperationsStock(cur_read_to_hap_op, cur_hap_to_ref_op,
+                                  read_len, read_to_ref_cigar_ops);
+      return;
+    }
+    const auto a = cur_read_to_hap_op.operation;
+    const auto b = cur_hap_to_ref_op.operation;
+    CHECK(!(a == nucleus::genomics::v1::CigarUnit::DELETE &&
+            b == nucleus::genomics::v1::CigarUnit::INSERT) &&
+          !(a == nucleus::genomics::v1::CigarUnit::INSERT &&
+            b == nucleus::genomics::v1::CigarUnit::DELETE));
+    static constexpr CigarUnit::Operation kOrder[] = {
+        nucleus::genomics::v1::CigarUnit::CLIP_SOFT,
+        nucleus::genomics::v1::CigarUnit::DELETE,
+        nucleus::genomics::v1::CigarUnit::INSERT,
+        nucleus::genomics::v1::CigarUnit::ALIGNMENT_MATCH};
+    for (auto op : kOrder) {
+      if (a == op || b == op) {
         MergeCigarOp(CigarOp(op, 1), read_len, read_to_ref_cigar_ops);
         break;
       }

@@ -277,6 +277,7 @@ class FastPassAligner {
   // be aligned with FastAlignReadsToHaplotype are aligned here.
   // Only alignment with better than score_threshold score are kept.
   void SswAlignReadsToHaplotypes(uint16_t score_threshold);
+  void SswAlignReadsToHaplotypesBatched(uint16_t score_threshold);
 
   // Initialize SSW library.
   void InitSswLib();
@@ -286,6 +287,8 @@ class FastPassAligner {
   // Align target sequence to the reference using SSW library. InitSswLib must
   // be called prior to calling SswAlign.
   Alignment SswAlign(const string& target) const;
+  // SswAlign for each target against the current reference, batched (#9).
+  std::vector<Alignment> SswAlignBatch(const std::vector<string>& targets) const;
 
   // Align all haplotypes to the reference using SSW library.
   void AlignHaplotypesToReference();
@@ -347,6 +350,25 @@ class FastPassAligner {
   // index of reads. Allows to find all reads that contain a given k-mer
   // and their align position.
   KmerIndexType kmer_index_;
+
+  // Flat k-mer index (deepvariant-aws-graviton#9): each distinct k-mer gets a
+  // uid in first-seen order; kmer_occ_[kmer_start_[uid] .. kmer_start_[uid+1])
+  // are its occurrences in insertion order, as kmer_index_[kmer] would hold.
+  // Pure-ACGT k-mers are keyed by their 2-bit packing, others by string.
+  void BuildFlatIndex();
+  // uid of the k-mer at s[pos, pos + kmer_size_), or -1. code/valid from
+  // KmerCodes.
+  int64_t FlatKmerUid(absl::string_view s, size_t pos, uint64_t code,
+                      bool valid) const;
+  void KmerCodes(absl::string_view s, std::vector<uint64_t>* codes,
+                 std::vector<uint8_t>* valid) const;
+  bool flat_index_ = false;
+  absl::flat_hash_map<uint64_t, uint32_t> kmer_uid_packed_;
+  absl::flat_hash_map<absl::string_view, uint32_t> kmer_uid_other_;
+  std::vector<uint32_t> kmer_start_;
+  std::vector<KmerOccurrence> kmer_occ_;
+  std::vector<uint64_t> hap_codes_;
+  std::vector<uint8_t> hap_valid_;
 
   // Vector of reads that need to be realigned
   std::vector<string> reads_;
