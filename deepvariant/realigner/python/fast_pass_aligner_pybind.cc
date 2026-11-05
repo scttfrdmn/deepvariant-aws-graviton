@@ -68,6 +68,22 @@ PYBIND11_MODULE(fast_pass_aligner, m) {
            py::arg("ref_prefix_len"))
       .def("set_ref_suffix_len", &FastPassAligner::set_ref_suffix_len,
            py::arg("set_ref_suffix_len"))
+      // Copy-free variant (deepvariant-aws-graviton#10): the reads are
+      // passed as pointers to the Python protos, and only reads whose
+      // alignment is replaced come back, with their input indices.
+      .def("realign_reads_views",
+           [](FastPassAligner* self,
+              const std::vector<
+                  nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>&
+                  reads) {
+             std::vector<const nucleus::genomics::v1::Read*> ptrs;
+             ptrs.reserve(reads.size());
+             for (const auto& r : reads) ptrs.push_back(r.p_);
+             std::vector<int> idx;
+             std::vector<nucleus::genomics::v1::Read> changed;
+             self->AlignReadsViews(ptrs, &idx, &changed);
+             return std::make_pair(std::move(idx), std::move(changed));
+           })
       .def("realign_reads",
            [](FastPassAligner* self,
               const std::vector<nucleus::genomics::v1::Read>& reads_param) {

@@ -139,7 +139,27 @@ FastPassAligner::AlignReads(
   for (const auto& read : reads_param) {
     reads_.push_back(absl::AsciiStrToUpper(read.aligned_sequence()));
   }
+  AlignReadsCore();
+  std::unique_ptr<std::vector<nucleus::genomics::v1::Read>> realigned_reads(
+      new std::vector<nucleus::genomics::v1::Read>());
+  RealignReadsToReference(reads_param, &realigned_reads);
+  return realigned_reads;
+}
 
+void FastPassAligner::AlignReadsViews(
+    absl::Span<const nucleus::genomics::v1::Read* const> reads,
+    std::vector<int>* changed_index,
+    std::vector<nucleus::genomics::v1::Read>* changed) {
+  CHECK(!force_alignment_);
+  reads_.reserve(reads_.size() + reads.size());
+  for (const auto* read : reads) {
+    reads_.push_back(absl::AsciiStrToUpper(read->aligned_sequence()));
+  }
+  AlignReadsCore();
+  RealignChangedReadsToReference(reads, changed_index, changed);
+}
+
+void FastPassAligner::AlignReadsCore() {
   CalculateSswAlignmentScoreThreshold();
 
   // Build index
@@ -168,14 +188,10 @@ FastPassAligner::AlignReads(
             read_to_haplotype_alignments_.end());
 
   // Realign reads that we could successfully realign in previous steps back to
-  // reference. From all read to haplotype alignments the best one is picked.
+  // reference (RealignReadsToReference / RealignChangedReadsToReference).
+  // From all read to haplotype alignments the best one is picked.
   // In the case where read alignments are equally good to ref haplotype and
   // non-ref haplotype, a non-ref haplotype is preferred.
-  std::unique_ptr<std::vector<nucleus::genomics::v1::Read>> realigned_reads(
-      new std::vector<nucleus::genomics::v1::Read>());
-  RealignReadsToReference(reads_param, &realigned_reads);
-
-  return realigned_reads;
 }
 
 void FastPassAligner::InitSswLib() {
@@ -718,6 +734,57 @@ void FastPassAligner::RealignReadsToReference(
       }
     }
   }  // for
+}
+
+// RealignReadsToReference without copies (deepvariant-aws-graviton#10): with
+// force_alignment off, every read whose alignment is not replaced comes out as
+// an unchanged copy of the input, so only the replaced ones are produced here
+// (changed_index[j] is the input index of changed[j]); the caller keeps the
+// other input reads as they are.
+void FastPassAligner::RealignChangedReadsToReference(
+    absl::Span<const nucleus::genomics::v1::Read* const> reads,
+    std::vector<int>* changed_index,
+    std::vector<nucleus::genomics::v1::Read>* changed) {
+  for (size_t read_index = 0; read_index < reads.size(); read_index++) {
+    const nucleus::genomics::v1::Read& read = *reads[read_index];
+    int best_hap_index = -1;
+    if (!GetBestReadAlignment(read_index, &best_hap_index)) continue;
+    const HaplotypeReadsAlignment& bestHaplotypeAlignments =
+        read_to_haplotype_alignments_[best_hap_index];
+    auto read_to_hap_pos =
+        bestHaplotypeAlignments.read_alignment_scores[read_index].position;
+    CHECK(read_to_hap_pos <
+          bestHaplotypeAlignments.hap_to_ref_positions_map.size());
+    int hap_to_ref_position =
+        bestHaplotypeAlignments.hap_to_ref_positions_map[read_to_hap_pos];
+    std::list<CigarOp> readToRefCigarOps;
+    CalculateReadToRefAlignment(
+        read_index, bestHaplotypeAlignments.read_alignment_scores[read_index],
+        bestHaplotypeAlignments.cigar_ops, &readToRefCigarOps);
+    if (!normalize_reads_) {
+      if (!IsAlignmentNormalized(readToRefCigarOps,
+                                 bestHaplotypeAlignments.ref_pos +
+                                     read_to_hap_pos + hap_to_ref_position,
+                                 reads_[read_index])) {
+        readToRefCigarOps.clear();
+      }
+    }
+    if (readToRefCigarOps.empty()) continue;  // alignment kept: unchanged
+    nucleus::genomics::v1::Read realigned_read;
+    realigned_read.MergeFrom(read);
+    auto* new_alignment = realigned_read.mutable_alignment();
+    new_alignment->clear_cigar();
+    new_alignment->mutable_position()->set_position(
+        region_position_in_chr_ + bestHaplotypeAlignments.ref_pos +
+        read_to_hap_pos + hap_to_ref_position);
+    for (auto& op : readToRefCigarOps) {
+      auto* cu = new_alignment->add_cigar();
+      cu->set_operation(op.operation);
+      cu->set_operation_length(op.length);
+    }
+    changed_index->push_back(static_cast<int>(read_index));
+    changed->push_back(std::move(realigned_read));
+  }
 }
 
 void FastPassAligner::AddKmerToIndex(absl::string_view kmer,

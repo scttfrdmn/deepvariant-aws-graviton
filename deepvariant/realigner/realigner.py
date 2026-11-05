@@ -780,7 +780,17 @@ class Realigner(object):
         ref_prefix + target + ref_suffix
         for target in assembled_region.haplotypes
     ])
-    return fast_pass_realigner.realign_reads(assembled_region.reads)
+    if os.environ.get('DV_FPA_COPY'):
+      return fast_pass_realigner.realign_reads(assembled_region.reads)
+    # Copy-free (deepvariant-aws-graviton#10): unchanged reads are returned as
+    # the same objects; only reads whose alignment is replaced are new.
+    idx, changed = fast_pass_realigner.realign_reads_views(
+        assembled_region.reads
+    )
+    out = list(assembled_region.reads)
+    for i, r in zip(idx, changed):
+      out[i] = r
+    return out
 
   def realign_reads(self, reads, region):
     """Run realigner.

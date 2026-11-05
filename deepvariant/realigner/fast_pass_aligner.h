@@ -263,6 +263,14 @@ class FastPassAligner {
   std::unique_ptr<std::vector<nucleus::genomics::v1::Read>> AlignReads(
       absl::Span<const nucleus::genomics::v1::Read> reads_param);
 
+  // AlignReads without copying the reads (deepvariant-aws-graviton#10):
+  // returns only the reads whose alignment is replaced, with their input
+  // indices; every other read is unchanged. Requires force_alignment off.
+  void AlignReadsViews(
+      absl::Span<const nucleus::genomics::v1::Read* const> reads,
+      std::vector<int>* changed_index,
+      std::vector<nucleus::genomics::v1::Read>* changed);
+
   // Build K-mer index for all reads.
   void BuildIndex();
 
@@ -325,6 +333,11 @@ class FastPassAligner {
   // an original alignment is preserved.
   // realigned_reads param is eventually passed to Python wrapped in unique_ptr
   // as per clif requirements.
+  void AlignReadsCore();
+  void RealignChangedReadsToReference(
+      absl::Span<const nucleus::genomics::v1::Read* const> reads,
+      std::vector<int>* changed_index,
+      std::vector<nucleus::genomics::v1::Read>* changed);
   void RealignReadsToReference(
       absl::Span<const nucleus::genomics::v1::Read> reads,
       std::unique_ptr<std::vector<nucleus::genomics::v1::Read>>*
