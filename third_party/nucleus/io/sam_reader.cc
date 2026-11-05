@@ -44,7 +44,12 @@
 #include <utility>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
 #include "absl/log/log.h"
+#include "google/protobuf/io/coded_stream.h"
+#include "google/protobuf/io/zero_copy_stream_impl_lite.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -917,6 +922,124 @@ class SamQueryIterable : public SamIterableBase {
   hts_itr_t* iter_;
 };
 
+
+// One tile of BAM records in BAM's own encoding (packed 4-bit sequence,
+// qualities, packed CIGAR, name and aux bytes): one pool, one header per
+// record. Records are in file order, which for an indexed BAM is coordinate
+// order, exactly as sam_itr_next returns them.
+struct TileArena {
+  int tid = -1;
+  int64_t start = 0, end = 0;
+  int64_t max_span = 0;  // max(bam_endpos - pos) over the tile
+  struct Rec {
+    bam1_core_t core;
+    uint32_t off, l_data;
+    int64_t endpos;
+  };
+  std::vector<Rec> recs;
+  std::vector<uint8_t> pool;
+};
+
+namespace {
+
+bool TileFetchEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("DV_TILE_FETCH");
+    return !(e && std::string(e) == "0");
+  }();
+  return on;
+}
+
+int64_t TileBp() {
+  static const int64_t bp = [] {
+    const char* e = std::getenv("DV_TILE_BP");
+    int64_t v = e ? std::atoll(e) : 0;
+    return v > 0 ? v : int64_t{64000};
+  }();
+  return bp;
+}
+
+bool TileSelfCheck() {
+  static const bool on = std::getenv("DV_TILE_SELFCHECK") != nullptr;
+  return on;
+}
+
+// A bam1_t view of an arena record (read-only; ConvertToPb only reads it).
+void ViewOf(const TileArena& a, const TileArena::Rec& r, bam1_t* b) {
+  std::memset(b, 0, sizeof(*b));
+  b->core = r.core;
+  b->data = const_cast<uint8_t*>(a.pool.data()) + r.off;
+  b->l_data = static_cast<int>(r.l_data);
+  b->m_data = r.l_data;
+}
+
+std::string DeterministicBytes(const nucleus::genomics::v1::Read& m) {
+  std::string s;
+  {
+    google::protobuf::io::StringOutputStream sos(&s);
+    google::protobuf::io::CodedOutputStream cos(&sos);
+    cos.SetSerializationDeterministic(true);
+    m.SerializeToCodedStream(&cos);
+  }
+  return s;
+}
+
+struct SelfCheckStats {
+  long regions = 0, reads = 0, mismatched_regions = 0;
+  ~SelfCheckStats() {
+    if (regions)
+      fprintf(stderr, "DV_TILE_SELFCHECK regions=%ld reads=%ld mismatched_regions=%ld\n",
+              regions, reads, mismatched_regions);
+  }
+};
+SelfCheckStats& Stats() {
+  static SelfCheckStats s;
+  return s;
+}
+
+}  // namespace
+
+// Iterates one region's reads from a tile, with the same overlap test as
+// hts_itr_next (pos < end && bam_endpos > start), the same conversion and the
+// same KeepRead filter as SamIterableBase::Next.
+class TileQueryIterable : public SamIterable {
+ public:
+  TileQueryIterable(const SamReader* reader, bam_hdr_t* header,
+                    std::shared_ptr<const TileArena> tile, int64_t start,
+                    int64_t end)
+      : Iterable(reader), header_(header), tile_(std::move(tile)),
+        start_(start), end_(end) {
+    // First record that can overlap: pos >= start - max_span (recs sorted by pos).
+    const int64_t lo = start_ - tile_->max_span;
+    auto it = std::lower_bound(
+        tile_->recs.begin(), tile_->recs.end(), lo,
+        [](const TileArena::Rec& r, int64_t v) { return r.core.pos < v; });
+    i_ = it - tile_->recs.begin();
+  }
+  StatusOr<bool> Next(nucleus::genomics::v1::Read* out) override {
+    NUCLEUS_RETURN_IF_ERROR(CheckIsAlive());
+    const SamReader* sam_reader = static_cast<const SamReader*>(reader_);
+    bam1_t view;
+    while (i_ < tile_->recs.size()) {
+      const TileArena::Rec& r = tile_->recs[i_++];
+      if (r.core.pos >= end_) { i_ = tile_->recs.size(); return false; }
+      if (!(r.endpos > start_)) continue;
+      ViewOf(*tile_, r, &view);
+      ::nucleus::Status status = ConvertToPb(header_, &view, sam_reader->options(), out);
+      if (status.code() == absl::StatusCode::kAborted) continue;
+      NUCLEUS_RETURN_IF_ERROR(status);
+      if (sam_reader->KeepRead(*out)) return true;
+    }
+    return false;
+  }
+
+ private:
+  bam_hdr_t* header_;
+  std::shared_ptr<const TileArena> tile_;
+  int64_t start_, end_;
+  size_t i_ = 0;
+};
+
 SamReader::SamReader(const string& reads_path, const SamReaderOptions& options,
                      htsFile* fp, bam_hdr_t* header, hts_idx_t* idx)
     : options_(options),
@@ -1083,6 +1206,34 @@ StatusOr<std::shared_ptr<SamIterable>> SamReader::Query(
         absl::StrCat("Unknown reference_name ", region.ShortDebugString()));
   }
 
+  if (TileFetchEnabled() && options_.downsample_fraction() == 0.0) {
+    auto tile_or = TileFor(tid, region);
+    NUCLEUS_RETURN_IF_ERROR(tile_or.status());
+    std::shared_ptr<const TileArena> tile = tile_or.ValueOrDie();
+    if (TileSelfCheck()) {
+      // Both paths for this region, compared read by read.
+      std::vector<std::string> a, b;
+      nucleus::genomics::v1::Read r;
+      {
+        auto t = MakeIterable<TileQueryIterable>(this, header_, tile,
+                                                 region.start(), region.end());
+        while (t->Next(&r).ValueOrDie()) a.push_back(DeterministicBytes(r));
+      }
+      hts_itr_t* it = sam_itr_queryi(idx_, tid, region.start(), region.end());
+      if (it == nullptr)
+        return ::nucleus::NotFound("self-check query failed");
+      {
+        auto q = MakeIterable<SamQueryIterable>(this, fp_, header_, it);
+        while (q->Next(&r).ValueOrDie()) b.push_back(DeterministicBytes(r));
+      }
+      Stats().regions++;
+      Stats().reads += b.size();
+      if (a != b) Stats().mismatched_regions++;
+    }
+    return StatusOr<std::shared_ptr<SamIterable>>(MakeIterable<TileQueryIterable>(
+        this, header_, std::move(tile), region.start(), region.end()));
+  }
+
   // Note that query is 0-based inclusive on start and exclusive on end,
   // matching exactly the logic of our Range.
   hts_itr_t* iter = sam_itr_queryi(idx_, tid, region.start(), region.end());
@@ -1095,6 +1246,39 @@ StatusOr<std::shared_ptr<SamIterable>> SamReader::Query(
 
   return StatusOr<std::shared_ptr<SamIterable>>(
       MakeIterable<SamQueryIterable>(this, fp_, header_, iter));
+}
+
+StatusOr<std::shared_ptr<const TileArena>> SamReader::TileFor(
+    int tid, const Range& region) const {
+  if (tile_ && tile_->tid == tid && tile_->start <= region.start() &&
+      region.end() <= tile_->end)
+    return tile_;
+  const int64_t bp = TileBp();
+  auto t = std::make_shared<TileArena>();
+  t->tid = tid;
+  t->start = (region.start() / bp) * bp;
+  t->end = std::max<int64_t>(t->start + bp, region.end());
+  hts_itr_t* iter = sam_itr_queryi(idx_, tid, t->start, t->end);
+  if (iter == nullptr)
+    return ::nucleus::NotFound(absl::StrCat(
+        "region '", region.ShortDebugString(), "' specifies an unknown reference interval"));
+  bam1_t* b = bam_init1();
+  int code;
+  while ((code = sam_itr_next(fp_, iter, b)) >= 0) {
+    TileArena::Rec r;
+    r.core = b->core;
+    r.off = static_cast<uint32_t>(t->pool.size());
+    r.l_data = static_cast<uint32_t>(b->l_data);
+    r.endpos = bam_endpos(b);
+    t->max_span = std::max<int64_t>(t->max_span, r.endpos - b->core.pos);
+    t->pool.insert(t->pool.end(), b->data, b->data + b->l_data);
+    t->recs.push_back(r);
+  }
+  bam_destroy1(b);
+  hts_itr_destroy(iter);
+  if (code < -1) return ::nucleus::DataLoss("Failed to parse SAM record");
+  tile_ = t;
+  return tile_;
 }
 
 ::nucleus::Status SamReader::Close() {
