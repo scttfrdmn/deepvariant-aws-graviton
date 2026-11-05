@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include "absl/log/check.h"
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "third_party/nucleus/protos/struct.pb.h"
 #include "third_party/nucleus/protos/variants.pb.h"
@@ -43,7 +44,7 @@ void Rescale(int64_t* n_ref, int64_t* n_total, int64_t max_allowed) {
 }
 
 struct Site {
-  const AlleleCountSummary* s;
+  const AlleleCount* s;
   bool none_gq;  // ambiguous reference base: quantized_gq is None
   int quantized_gq;
   int raw_gq;
@@ -62,11 +63,11 @@ Variant MakeBlock(const Site& first, const Site& last, const std::string& sample
                   const std::array<double, 3>* gl, std::vector<int> genotype,
                   int64_t gq, int64_t min_dp, bool med, int64_t med_dp) {
   Variant v;
-  v.set_reference_name(first.s->reference_name());
+  v.set_reference_name(first.s->position().reference_name());
   v.set_reference_bases(first.s->ref_base());
   v.add_alternate_bases("<*>");
-  v.set_start(first.s->position());
-  v.set_end(last.s->position() + 1);
+  v.set_start(first.s->position().position());
+  v.set_end(last.s->position().position() + 1);
   VariantCall* call = v.add_calls();
   call->set_call_set_name(sample);
   for (int g : genotype) call->add_genotype(g);
@@ -83,20 +84,25 @@ std::vector<std::string> MakeGvcfRecords(const AlleleCounter& counter,
                                          int left_padding, int right_padding,
                                          const GvcfTable& table,
                                          const GvcfOptions& o) {
-  const std::vector<AlleleCountSummary> summaries =
-      counter.SummaryCounts(left_padding, right_padding);
+  // The fields AlleleCounter::SummaryCounts would copy into one
+  // AlleleCountSummary per position, read from the counts in place (#10).
+  const std::vector<AlleleCount>& counts = counter.Counts();
+  CHECK_GE(left_padding, 0);
+  CHECK_GE(right_padding, 0);
+  CHECK_LT(left_padding + right_padding, counts.size());
   std::vector<Site> sites;
-  sites.reserve(summaries.size());
-  for (const AlleleCountSummary& s : summaries) {
-    Site e{&s, false, 0, 0, nullptr, s.total_read_count(), true};
+  sites.reserve(counts.size() - left_padding - right_padding);
+  for (int ci = left_padding; ci < counts.size() - right_padding; ci++) {
+    const AlleleCount& s = counts[ci];
+    Site e{&s, false, 0, 0, nullptr, TotalAlleleCounts(s), true};
     if (!IsCanonical(s.ref_base())) {
       if (!IsExtendedIupac(s.ref_base()))
         throw std::invalid_argument("Invalid reference base=" + s.ref_base() +
                                     " found during gvcf calculation");
       e.none_gq = true;
     } else {
-      const int hap = o.haploid_contigs.count(s.reference_name()) ? 1 : 0;
-      int64_t n_ref = s.ref_supporting_read_count(), n_total = s.total_read_count();
+      const int hap = o.haploid_contigs.count(s.position().reference_name()) ? 1 : 0;
+      int64_t n_ref = s.ref_supporting_read_count(), n_total = e.read_depth;
       Rescale(&n_ref, &n_total, table.max_cache_coverage);
       const size_t idx = n_total * (n_total + 1) / 2 + n_ref;
       e.raw_gq = table.gq[hap][idx];

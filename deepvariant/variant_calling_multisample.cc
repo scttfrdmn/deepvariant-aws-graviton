@@ -34,6 +34,7 @@
 #include <stdlib.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iterator>
 #include <map>
@@ -774,24 +775,49 @@ std::vector<T> VariantCaller::AlleleCountsGenerator(
   // for each sample simultaneously.
   int skip_next_count = 0;
   int prev_deletion_end = 0;
+  // Positions where every sample's read alleles are REFERENCE (or none) can't
+  // yield an item: IsGoodAltAlleleWithReason rejects REFERENCE alleles, so
+  // alt_alleles is empty, and with these options F returns nullopt without
+  // touching any state or the sampler. Skipping them avoids copying each
+  // position's AlleleCount (with its read-allele map) per sample (#10).
+  static const bool kNoFast = std::getenv("DV_VC_NOFAST") != nullptr;
+  const bool fast_skip_ok =
+      !kNoFast && !options_.create_complex_alleles() &&
+      options_.fraction_reference_sites_to_emit() <= 0.0 &&
+      !options_.enable_methylation_calling() &&
+      !options_.enable_methylation_aware_phasing();
   while (allele_counter_iterators[target_sample_] !=
          target_sample_allele_counts.end()) {
-    absl::node_hash_map<std::string, AlleleCount> allele_counts_per_sample;
-    for (const auto& sample_counter : allele_counters_per_sample_) {
-      if (allele_counter_iterators[sample_counter.first] !=
-          allele_counters_per_sample_.at(
-              sample_counter.first)->Counts().end()) {
-        // allele_counts_per_sample contain AlleleCount for each sample for one
-        // position.
-        allele_counts_per_sample[sample_counter.first] =
-            *(allele_counter_iterators[sample_counter.first]);
+    bool all_ref_only = fast_skip_ok;
+    if (all_ref_only) {
+      for (const auto& sample_counter : allele_counters_per_sample_) {
+        const auto& sit = allele_counter_iterators[sample_counter.first];
+        if (sit == sample_counter.second->Counts().end()) continue;
+        for (const auto& entry : sit->read_alleles()) {
+          if (entry.second.type() != AlleleType::REFERENCE) {
+            all_ref_only = false;
+            break;
+          }
+        }
+        if (!all_ref_only) break;
       }
     }
     // Calling CallVariant for one position. allele_counts_per_sample contains
     // AlleleCount object for this position for each sample.
     if (skip_next_count > 0) {
       skip_next_count--;
-    } else {
+    } else if (!all_ref_only) {
+      absl::node_hash_map<std::string, AlleleCount> allele_counts_per_sample;
+      for (const auto& sample_counter : allele_counters_per_sample_) {
+        if (allele_counter_iterators[sample_counter.first] !=
+            allele_counters_per_sample_.at(
+                sample_counter.first)->Counts().end()) {
+          // allele_counts_per_sample contain AlleleCount for each sample for
+          // one position.
+          allele_counts_per_sample[sample_counter.first] =
+              *(allele_counter_iterators[sample_counter.first]);
+        }
+      }
       std::optional<T> item = (this->*F)(
           allele_counts_per_sample,
           &allele_counter_iterators[target_sample_],

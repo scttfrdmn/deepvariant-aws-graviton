@@ -165,7 +165,7 @@ int TotalAlleleCounts(const AlleleCount& allele_count,
                       bool include_low_quality) {
   int total_allele_counts = std::count_if(
       allele_count.read_alleles().begin(), allele_count.read_alleles().end(),
-      [include_low_quality](google::protobuf::Map<string, Allele>::value_type e) {
+      [include_low_quality](const google::protobuf::Map<string, Allele>::value_type& e) {
         return (!e.second.is_low_quality() || include_low_quality) &&
                e.second.type() != AlleleType::REFERENCE;
       });
@@ -183,7 +183,7 @@ int TotalAlleleCounts(absl::Span<const AlleleCount> allele_counts,
   for (const AlleleCount& allele_count : allele_counts) {
     total_allele_count += std::count_if(
         allele_count.read_alleles().begin(), allele_count.read_alleles().end(),
-        [include_low_quality](google::protobuf::Map<string, Allele>::value_type e) {
+        [include_low_quality](const google::protobuf::Map<string, Allele>::value_type& e) {
           return (!e.second.is_low_quality() || include_low_quality) &&
                  e.second.type() != AlleleType::REFERENCE;
         });
