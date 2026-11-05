@@ -540,6 +540,61 @@ void AlleleCounter::AddReadAlleles(const Read& read, absl::string_view sample,
   }
 }
 
+void AlleleCounter::AddReadAllelesFast(const Read& read,
+                                       absl::string_view sample,
+                                       absl::Span<const FastAllele> to_add,
+                                       absl::Span<const ReadAllele> indels) {
+  string key, sample_key;
+  bool have_keys = false;
+  for (size_t i = 0; i < to_add.size(); ++i) {
+    const FastAllele& a = to_add[i];
+    // ReadAllele::skip() is position == -1.
+    if (a.position == -1 || !IsValidIntervalOffset(a.position)) continue;
+    if (i + 1 < to_add.size() && a.position == to_add[i + 1].position) continue;
+
+    AlleleCount& allele_count = counts_[a.position];
+    if (a.type == AlleleType::REFERENCE && !a.is_low_quality) {
+      allele_count.set_ref_supporting_read_count(
+          allele_count.ref_supporting_read_count() + 1);
+    }
+    if (a.type != AlleleType::REFERENCE ||
+        (options_.enable_methylation_aware_phasing() ||
+         options_.enable_methylation_calling()) ||
+        (options_.track_ref_reads() &&
+         std::binary_search(candidate_positions_.begin(),
+                            candidate_positions_.end(), a.position))) {
+      if (!have_keys) {
+        key = ReadKey(read);
+        sample_key = std::string(sample);
+        have_keys = true;
+      }
+      auto* read_alleles = allele_count.mutable_read_alleles();
+      auto* sample_alleles = allele_count.mutable_sample_alleles();
+      const Allele allele =
+          a.indel >= 0
+              ? MakeAllele(indels[a.indel].bases(), a.type, 1, a.is_low_quality,
+                           a.mapping_quality, a.avg_base_quality,
+                           a.is_reverse_strand, a.is_methylated,
+                           static_cast<float>(a.methylation_level))
+              : MakeAllele(absl::string_view(&a.base, 1), a.type, 1,
+                           a.is_low_quality, a.mapping_quality,
+                           a.avg_base_quality, a.is_reverse_strand,
+                           a.is_methylated,
+                           static_cast<float>(a.methylation_level));
+      if (read_alleles->count(key)) {
+        static int counter = 0;
+        if (counter++ < 1) {
+          VLOG(2) << "Found duplicate read: " << key << " at "
+                  << allele_count.position().ShortDebugString();
+        }
+      }
+      (*read_alleles)[key] = allele;
+      Allele* new_allele = (*sample_alleles)[sample_key].add_alleles();
+      *new_allele = allele;
+    }
+  }
+}
+
 // Convenience function to check if operations is match. Note, that we treat
 // SEQUENCE_MISMATCH as ALIGNMENT_MATCH.
 bool IsOperationMatch(const nucleus::genomics::v1::CigarUnit& op) {
@@ -880,7 +935,10 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
   }
 
   const LinearAlignment& aln = read.alignment();
-  std::vector<ReadAllele> to_add;
+  // Allele records in the order Add() always produced them; single-base
+  // alleles carry their base inline, indels index into `indels`.
+  std::vector<FastAllele> to_add;
+  std::vector<ReadAllele> indels;
   to_add.reserve(read.aligned_quality().size());
   int read_offset = 0;
   int ref_interval_offset =
@@ -888,14 +946,25 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
   int interval_offset =
       aln.position().position() + read_shift - Interval().start();
   const string_view read_seq(read.aligned_sequence());
-  std::vector<CigarUnit> cigar;
-  if (cigar_to_use != nullptr) {
-    cigar.assign(cigar_to_use->begin(), cigar_to_use->end());
-  } else {
-    cigar.assign(aln.cigar().begin(), aln.cigar().end());
-  }
+  const auto& quals = read.aligned_quality();
+  const uint8_t mapq = static_cast<uint8_t>(aln.mapping_quality());
+  const bool reverse = aln.position().reverse_strand();
+  // GetMethylationLevel/IsMethylated return 0/false without modifications.
+  const bool has_mods = !read.base_modifications().empty();
+  const bool legacy = options_.keep_legacy_behavior();
+  const int min_bq = options_.read_requirements().min_base_quality();
 
-  for (const auto& cigar_elt : cigar) {
+  auto add_indel = [&](ReadAllele&& ra) {
+    FastAllele f{ra.position(), ra.type(), ra.is_low_quality(),
+                 ra.mapping_quality(), ra.avg_base_quality(),
+                 ra.is_reverse_strand(), ra.is_methylated(),
+                 static_cast<uint8_t>(ra.methylation_level()), 0,
+                 static_cast<int>(indels.size())};
+    indels.push_back(std::move(ra));
+    to_add.push_back(f);
+  };
+
+  auto process = [&](const CigarUnit& cigar_elt) {
     const int op_len = cigar_elt.operation_length();
     switch (cigar_elt.operation()) {
       case CigarUnit::ALIGNMENT_MATCH:
@@ -904,33 +973,29 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
         for (int i = 0; i < op_len; ++i) {
           const int ref_offset = ref_interval_offset + i;
           const int base_offset = read_offset + i;
-          bool is_low_quality_read_allele = false;
-          double methylation_calling_threshold =
-              options_.methylation_calling_threshold();
           bool is_methylated = false;
-          int32_t methylation_level = GetMethylationLevel(read, base_offset);
-          // Store methylation probability for each read allele.
-          // This is used for methylation-aware phasing.
-          if (IsMethylated(read, base_offset,
-                          options_.enable_methylation_calling(),
-                          methylation_calling_threshold)) {
-            is_methylated = true;
+          int32_t methylation_level = 0;
+          if (has_mods) {
+            methylation_level = GetMethylationLevel(read, base_offset);
+            is_methylated = IsMethylated(read, base_offset,
+                                         options_.enable_methylation_calling(),
+                                         options_.methylation_calling_threshold());
           }
-          if (IsValidRefOffset(ref_offset) &&
-              CanBasesBeUsed(read, base_offset, 1, options_,
-                             is_low_quality_read_allele)) {
-            const AlleleType type =
-                ref_bases_[ref_offset] == read_seq[base_offset]
-                    ? AlleleType::REFERENCE
-                    : AlleleType::SUBSTITUTION;
-            to_add.emplace_back(
-                interval_offset + i, string(read_seq.substr(base_offset, 1)),
-                type, is_low_quality_read_allele,
-                read.alignment().mapping_quality(),
-                read.aligned_quality()[base_offset],
-                read.alignment().position().reverse_strand(), is_methylated,
-                methylation_level);
-          }
+          if (!IsValidRefOffset(ref_offset)) continue;
+          // CanBasesBeUsed(read, base_offset, 1, ...), inlined.
+          CHECK_LE(base_offset + 1, quals.size());
+          const int q = quals[base_offset];
+          if (q < min_bq && legacy) continue;
+          if (!nucleus::IsCanonicalBase(read_seq[base_offset])) continue;
+          const bool is_low_quality = !legacy && q < min_bq;
+          const AlleleType type = ref_bases_[ref_offset] == read_seq[base_offset]
+                                      ? AlleleType::REFERENCE
+                                      : AlleleType::SUBSTITUTION;
+          to_add.push_back(FastAllele{interval_offset + i, type, is_low_quality,
+                                      mapq, static_cast<uint8_t>(q), reverse,
+                                      is_methylated,
+                                      static_cast<uint8_t>(methylation_level),
+                                      read_seq[base_offset], -1});
         }
         read_offset += op_len;
         ref_interval_offset += op_len;
@@ -938,39 +1003,36 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
         break;
       case CigarUnit::CLIP_SOFT:
       case CigarUnit::INSERT:
-        // Note, by convention VCF insertion/deletion are at the preceding base.
-        to_add.push_back(MakeIndelReadAllele(read, interval_offset,
-                                             ref_interval_offset, read_offset,
-                                             cigar_elt));
+        add_indel(MakeIndelReadAllele(read, interval_offset,
+                                      ref_interval_offset, read_offset,
+                                      cigar_elt));
         read_offset += op_len;
-        // No interval offset change, since an insertion doesn't move us on ref.
         break;
       case CigarUnit::DELETE:
-        // By convention VCF insertion/deletion are at the preceding base.
-        to_add.push_back(MakeIndelReadAllele(read, interval_offset,
-                                             ref_interval_offset, read_offset,
-                                             cigar_elt));
-        // No read offset change, since a deletion doesn't consume read bases.
+        add_indel(MakeIndelReadAllele(read, interval_offset,
+                                      ref_interval_offset, read_offset,
+                                      cigar_elt));
         ref_interval_offset += op_len;
         interval_offset += op_len;
         break;
       case CigarUnit::PAD:
       case CigarUnit::SKIP:
-        // No read offset change, since a pad/skip don't consume read bases.
         ref_interval_offset += op_len;
         interval_offset += op_len;
         break;
       case CigarUnit::CLIP_HARD:
         break;
       default:
-        // Lots of misc. enumerated values from proto that aren't useful such as
-        // enumeration values INT_MIN_SENTINEL_DO_NOT_USE_ and
-        // OPERATION_UNSPECIFIED.
         break;
     }
+  };
+  if (cigar_to_use != nullptr) {
+    for (const auto& c : *cigar_to_use) process(c);
+  } else {
+    for (const auto& c : aln.cigar()) process(c);
   }
 
-  AddReadAlleles(read, sample, to_add);
+  AddReadAllelesFast(read, sample, to_add, indels);
   ++n_reads_counted_;
 }
 

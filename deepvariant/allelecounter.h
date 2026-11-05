@@ -442,6 +442,26 @@ class AlleleCounter {
                       absl::string_view sample,
                       absl::Span<const ReadAllele> to_add);
 
+  // Add()'s fast path (deepvariant-aws-graviton): the same allele sequence as
+  // a ReadAllele vector, with single-base alleles stored without a string;
+  // AddReadAllelesFast applies AddReadAlleles' exact rules.
+  struct FastAllele {
+    int position;
+    AlleleType type;
+    bool is_low_quality;
+    uint8_t mapping_quality;
+    uint8_t avg_base_quality;
+    bool is_reverse_strand;
+    bool is_methylated;
+    uint8_t methylation_level;
+    char base;   // single-base alleles
+    int indel;   // index into the indel ReadAlleles, or -1
+  };
+  void AddReadAllelesFast(const nucleus::genomics::v1::Read& read,
+                          absl::string_view sample,
+                          absl::Span<const FastAllele> to_add,
+                          absl::Span<const ReadAllele> indels);
+
   // Normalize cigar by shifting INDELs in the middle of a repeat all the way
   // to the left. As a result of shifting two INDELs may become merged. Merged
   // INDEL may become non-normalized so the process is repeated up to 10 times.
