@@ -308,14 +308,18 @@ void AlleleCounter::Init() {
   // If interval_ starts before reads_interval_ start then we don't need to
   // offset reference bases.
   full_interval_offset = std::max(full_interval_offset, 0L);
+  // Built in place: same fields as MakePosition (reverse_strand false is the
+  // proto3 default) without a temporary Position and a copy of each
+  // AlleleCount (#10).
   for (int i = 0; i < len; ++i) {
-    AlleleCount allele_count;
+    AlleleCount& allele_count = counts_.emplace_back();
     const int64_t pos = interval_.start() + i;
-    *(allele_count.mutable_position()) =
-        nucleus::MakePosition(interval_.reference_name(), pos);
-    allele_count.set_ref_base(ref_bases_.substr(i + full_interval_offset, 1));
+    auto* position = allele_count.mutable_position();
+    position->set_reference_name(interval_.reference_name());
+    position->set_position(pos);
+    position->set_reverse_strand(false);
+    allele_count.set_ref_base(ref_bases_.data() + i + full_interval_offset, 1);
     allele_count.set_track_ref_reads(options_.track_ref_reads());
-    counts_.push_back(allele_count);
   }
 }
 
