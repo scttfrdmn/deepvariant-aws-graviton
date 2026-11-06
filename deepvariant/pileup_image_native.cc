@@ -42,6 +42,10 @@
 #include <vector>
 
 #include "deepvariant/pileup_channel_lib.h"
+#include "deepvariant/channels/read_supports_variant_channel.h"
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "deepvariant/sampling_util.h"
 #include "absl/container/flat_hash_map.h"
@@ -197,6 +201,77 @@ absl::StatusOr<std::vector<int>> DownsampleReadIndicesWithMinsPerAllele(
                                            max_reads, min_per_allele, gen);
 }
 
+
+// aws-realign#130: env-gated capture of BuildPileupForOneSample's inputs and
+// output rows (DV_DUMP_PILEUP=<prefix> writes <prefix>.<pid>.bin), so a GPU
+// encoder can be gated bit-for-bit against this code on real candidates.
+namespace {
+template <typename T>
+void DumpPod(FILE* f, const T& v) { fwrite(&v, sizeof(T), 1, f); }
+void DumpBytes(FILE* f, absl::string_view s) { fwrite(s.data(), 1, s.size(), f); }
+FILE* PileupDumpFile() {
+  static FILE* f = [] () -> FILE* {
+    const char* p = std::getenv("DV_DUMP_PILEUP");
+    if (p == nullptr || *p == 0) return nullptr;
+    std::string path = std::string(p) + "." + std::to_string(getpid()) + ".bin";
+    return fopen(path.c_str(), "wb");
+  }();
+  return f;
+}
+}  // namespace
+
+void PileupImageEncoderNative::DumpPileupCall(
+    const DeepVariantCall& dv_call, const string& ref_bases,
+    const std::vector<const Read*>& reads, int image_start_pos,
+    const vector<std::string>& alt_alleles, int max_reads,
+    const std::vector<int>& sampled_indices,
+    const std::vector<int64_t>* alignment_positions,
+    const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank,
+    const std::vector<std::unique_ptr<ImageRow>>& rows) {
+  FILE* f = PileupDumpFile();
+  if (f == nullptr) return;
+  const auto& o = options_;
+  DumpPod(f, uint32_t{0x454c4950});  // "PILE"
+  DumpPod(f, int32_t(ref_bases.size())); DumpPod(f, int32_t(rows.size()));
+  DumpPod(f, int32_t(o.reference_band_height()));
+  DumpPod(f, int32_t(channel_enums_.size()));
+  for (auto e : channel_enums_) DumpPod(f, int32_t(e));
+  DumpPod(f, int32_t(o.base_color_offset_a_and_g())); DumpPod(f, int32_t(o.base_color_offset_t_and_c()));
+  DumpPod(f, int32_t(o.base_color_stride())); DumpPod(f, int32_t(o.reference_base_quality()));
+  DumpPod(f, float(o.base_quality_cap())); DumpPod(f, float(o.mapping_quality_cap()));
+  DumpPod(f, int32_t(o.positive_strand_color())); DumpPod(f, int32_t(o.negative_strand_color()));
+  DumpPod(f, float(o.allele_supporting_read_alpha())); DumpPod(f, float(o.allele_unsupporting_read_alpha()));
+  DumpPod(f, float(o.other_allele_supporting_read_alpha()));
+  DumpPod(f, float(o.reference_matching_read_alpha())); DumpPod(f, float(o.reference_mismatching_read_alpha()));
+  DumpPod(f, uint8_t(o.indel_anchoring_base_char()[0]));
+  DumpPod(f, int32_t(o.read_requirements().min_mapping_quality()));
+  DumpPod(f, int32_t(o.read_requirements().min_base_quality()));
+  DumpPod(f, int32_t(channels_enum_to_blank.size()));
+  DumpPod(f, int64_t(dv_call.variant().start())); DumpPod(f, int32_t(image_start_pos));
+  DumpBytes(f, ref_bases);
+  DumpPod(f, int32_t(max_reads)); DumpPod(f, int32_t(sampled_indices.size()));
+  ReadSupportsVariantChannel support(ref_bases.size(), options_);
+  for (int index : sampled_indices) {
+    const Read& r = *reads[index];
+    int64_t sort_pos = (alignment_positions == nullptr || alignment_positions->empty())
+                           ? r.alignment().position().position() : alignment_positions->at(index);
+    DumpPod(f, int32_t(sort_pos)); DumpPod(f, int32_t(GetHapIndex(r)));
+    DumpPod(f, int32_t(r.alignment().position().position()));
+    DumpPod(f, int32_t(r.alignment().mapping_quality()));
+    DumpPod(f, uint8_t(r.alignment().position().reverse_strand()));
+    DumpPod(f, int32_t(r.fragment_length())); DumpPod(f, int32_t(r.read_number()));
+    DumpPod(f, uint16_t(r.fragment_name().size())); DumpBytes(f, r.fragment_name());
+    DumpPod(f, uint8_t(support.ReadSupportsAlt(dv_call, r, alt_alleles)));
+    DumpPod(f, int32_t(r.alignment().cigar_size()));
+    for (const auto& c : r.alignment().cigar()) { DumpPod(f, uint8_t(c.operation())); DumpPod(f, int32_t(c.operation_length())); }
+    DumpPod(f, int32_t(r.aligned_sequence().size())); DumpBytes(f, r.aligned_sequence());
+    DumpPod(f, int32_t(r.aligned_quality().size()));
+    for (auto q : r.aligned_quality()) DumpPod(f, uint8_t(q));
+  }
+  for (const auto& row : rows)
+    for (const auto& ch : row->channel_data) fwrite(ch.data(), 1, ch.size(), f);
+}
+
 std::vector<std::unique_ptr<ImageRow>>
 PileupImageEncoderNative::BuildPileupForOneSample(
     const DeepVariantCall& dv_call, const string& ref_bases,
@@ -312,6 +387,9 @@ PileupImageEncoderNative::BuildPileupForOneSample(
     }
   }
 
+  DumpPileupCall(dv_call, ref_bases, reads, image_start_pos, alt_alleles,
+                 max_reads, sampled_indices, alignment_positions,
+                 channels_enum_to_blank, rows);
   return rows;
 }
 
