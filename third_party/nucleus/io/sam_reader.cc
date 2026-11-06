@@ -1206,7 +1206,18 @@ StatusOr<std::shared_ptr<SamIterable>> SamReader::Query(
         absl::StrCat("Unknown reference_name ", region.ShortDebugString()));
   }
 
-  if (TileFetchEnabled() && options_.downsample_fraction() == 0.0) {
+  // Tiles pay off only when consecutive queries walk the genome in order (an
+  // unsharded task, or contiguous shards). make_examples' default round-robin
+  // sharding gives task i every Nth 1 kb region, so a fixed-size tile would be
+  // decoded for one region. Use a tile only when this query continues the last
+  // one (or is already inside the current tile); otherwise query directly.
+  const bool in_tile = tile_ && tile_->tid == tid &&
+                       tile_->start <= region.start() && region.end() <= tile_->end;
+  const bool sequential = tid == last_tid_ && region.start() == last_end_;
+  last_tid_ = tid;
+  last_end_ = region.end();
+  if (TileFetchEnabled() && options_.downsample_fraction() == 0.0 &&
+      (in_tile || sequential)) {
     auto tile_or = TileFor(tid, region);
     NUCLEUS_RETURN_IF_ERROR(tile_or.status());
     std::shared_ptr<const TileArena> tile = tile_or.ValueOrDie();

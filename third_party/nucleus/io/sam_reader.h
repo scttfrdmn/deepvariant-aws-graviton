@@ -200,6 +200,10 @@ class SamReader : public Reader {
   // decoded once and kept in BAM's own encoding; Query serves regions inside
   // the tile from it. Off with DV_TILE_FETCH=0 or downsampling.
   mutable std::shared_ptr<const struct TileArena> tile_;
+  // Last Query() target: tiles are built only for sequential access, so a
+  // sharded (round-robin) task never decodes a tile it uses one region of.
+  mutable int last_tid_ = -1;
+  mutable int64_t last_end_ = -1;
   ::nucleus::StatusOr<std::shared_ptr<const struct TileArena>> TileFor(
       int tid, const nucleus::genomics::v1::Range& region) const;
 };
