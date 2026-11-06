@@ -156,6 +156,51 @@ std::vector<Allele> SumAlleleCounts(absl::Span<const AlleleCount> allele_counts,
   return to_return;
 }
 
+std::vector<Allele> SumAlleleCountsPtrs(
+    absl::Span<const AlleleCount* const> allele_counts,
+    bool include_low_quality) {
+  std::map<std::pair<string_view, AlleleType>, int> allele_sums;
+  for (const AlleleCount* allele_count : allele_counts) {
+    for (const auto& entry : allele_count->read_alleles()) {
+      if (include_low_quality || !entry.second.is_low_quality()) {
+        ++allele_sums[{entry.second.bases(), entry.second.type()}];
+      }
+    }
+  }
+  std::vector<Allele> to_return;
+  to_return.reserve(allele_sums.size());
+  for (const auto& entry : allele_sums) {
+    to_return.push_back(
+        MakeAllele(entry.first.first, entry.first.second, entry.second));
+  }
+  int ref_support_for_all_samples = 0;
+  for (const AlleleCount* allele_count : allele_counts) {
+    ref_support_for_all_samples += allele_count->ref_supporting_read_count();
+  }
+  if (ref_support_for_all_samples > 0 && !allele_counts.empty() &&
+      !allele_counts[0]->track_ref_reads()) {
+    to_return.push_back(MakeAllele(allele_counts[0]->ref_base(),
+                                   AlleleType::REFERENCE,
+                                   ref_support_for_all_samples));
+  }
+  return to_return;
+}
+
+int TotalAlleleCountsPtrs(absl::Span<const AlleleCount* const> allele_counts,
+                          bool include_low_quality) {
+  int total_allele_count = 0;
+  for (const AlleleCount* allele_count : allele_counts) {
+    total_allele_count += std::count_if(
+        allele_count->read_alleles().begin(), allele_count->read_alleles().end(),
+        [include_low_quality](const google::protobuf::Map<string, Allele>::value_type& e) {
+          return (!e.second.is_low_quality() || include_low_quality) &&
+                 e.second.type() != AlleleType::REFERENCE;
+        });
+    total_allele_count += allele_count->ref_supporting_read_count();
+  }
+  return total_allele_count;
+}
+
 // TODO Consolidate TotalAlleleCounts functions into one since the
 // functionality is identical.
 // Allele counter tracks reads supporting alt alleles. Simple counter is used

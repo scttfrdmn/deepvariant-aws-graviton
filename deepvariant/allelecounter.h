@@ -80,6 +80,12 @@ std::vector<Allele> SumAlleleCounts(const AlleleCount& allele_count,
 std::vector<Allele> SumAlleleCounts(absl::Span<const AlleleCount> allele_counts,
                                     bool include_low_quality = false);
 
+// SumAlleleCounts(Span<const AlleleCount>) over pointers to the same
+// AlleleCounts, in the same order: identical result, no copies (#10).
+std::vector<Allele> SumAlleleCountsPtrs(
+    absl::Span<const AlleleCount* const> allele_counts,
+    bool include_low_quality = false);
+
 // Gets the total count of observed alleles in this allele_count, which is the
 // sum of the observed non-reference alleles in read_alleles + the total number
 // of reference supporting reads.
@@ -91,6 +97,10 @@ int TotalAlleleCounts(const AlleleCount& allele_count,
 // read_alleles + the total number of reference supporting reads.
 int TotalAlleleCounts(absl::Span<const AlleleCount> allele_counts,
                       bool include_low_quality = false);
+
+// TotalAlleleCounts(Span<const AlleleCount>) over pointers (#10).
+int TotalAlleleCountsPtrs(absl::Span<const AlleleCount* const> allele_counts,
+                          bool include_low_quality = false);
 
 // Binary search for allele index by position.
 int AlleleIndex(absl::Span<const AlleleCount> allele_counts, int64_t pos);

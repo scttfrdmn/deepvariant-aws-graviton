@@ -529,45 +529,42 @@ SelectAltAllelesResult
 // IsGoodAltAllele().
 SelectAltAllelesResult VariantCaller::SelectAltAlleles(
     const SelectAltAllelesInputOptions& options) const {
-  SelectAltAllelesResult output_options;
-  // allele_counts_mod is initialized to be the same as allele_counts. If
-  // complex variants are eneabled then allele_counts_mod will be modified.
-  for (const auto& [sample_name, allele_count] :
-           options.allele_counts_by_sample) {
-      output_options.allele_counts_mod.insert({sample_name, allele_count});
-  }
+  // (Upstream also copied every sample's AlleleCount into an
+  // allele_counts_mod here; neither return path used it, the complex-variant
+  // path builds its own. Removed, with the per-sample copies below now
+  // pointers (#10).)
 
   // allele_counts.at will throw an exception if key is not found.
   // Absent target_sample is a critical error.
   auto it = options.allele_counts_by_sample.find(target_sample_);
   CHECK(it != options.allele_counts_by_sample.end());
   const AlleleCount& target_sample_allele_count = it->second;
-  std::vector<AlleleCount> all_samples_allele_counts;
+  std::vector<const AlleleCount*> all_samples_allele_counts;
   all_samples_allele_counts.reserve(options.allele_counts_by_sample.size());
   // "Non-target" samples are referring to all the samples that are providing
   // supportive information. Usually the main truth labels are not from this
   // sample, or usually it means that the calls coming from these non-target
   // samples are not the main focus of our problem.
-  std::vector<AlleleCount> non_target_allele_counts;
+  std::vector<const AlleleCount*> non_target_allele_counts;
   non_target_allele_counts.reserve(options.allele_counts_by_sample.size());
   for (const auto& allele_counts_entry : options.allele_counts_by_sample) {
-    all_samples_allele_counts.push_back(allele_counts_entry.second);
+    all_samples_allele_counts.push_back(&allele_counts_entry.second);
     if (allele_counts_entry.first != target_sample_) {
-      non_target_allele_counts.push_back(allele_counts_entry.second);
+      non_target_allele_counts.push_back(&allele_counts_entry.second);
     }
   }
 
   const std::vector<Allele> target_sample_alleles =
       SumAlleleCounts(target_sample_allele_count);
   const std::vector<Allele> all_sample_alleles =
-      SumAlleleCounts(all_samples_allele_counts);
+      SumAlleleCountsPtrs(all_samples_allele_counts);
   const std::vector<Allele> non_target_sample_alleles =
-      SumAlleleCounts(non_target_allele_counts);
+      SumAlleleCountsPtrs(non_target_allele_counts);
 
   const int target_samples_total_count =
       TotalAlleleCounts(target_sample_allele_count);
   const int all_samples_total_count =
-      TotalAlleleCounts(all_samples_allele_counts);
+      TotalAlleleCountsPtrs(all_samples_allele_counts);
 
   std::vector<Allele> alt_alleles;
   for (const auto& allele : target_sample_alleles) {
@@ -1148,10 +1145,10 @@ void VariantCaller::AddAdjacentAlleleFractionsAtPosition(
   int start = std::min(index, half_window_size);
   int end = std::min((int)target_sample_allele_counts.size() - index,
                      half_window_size + 1);
-  const std::vector<AlleleCount>& context_allele_counts = {
-      target_sample_allele_count_iterator - start,
-      target_sample_allele_count_iterator + end};
-  for (const auto& context_allele_count : context_allele_counts) {
+  // The window is read in place (upstream copied it into a temporary vector).
+  for (auto cit = target_sample_allele_count_iterator - start;
+       cit != target_sample_allele_count_iterator + end; ++cit) {
+    const AlleleCount& context_allele_count = *cit;
     int depth = context_allele_count.ref_supporting_read_count() +
                 context_allele_count.read_alleles_size();
     int vaf = 0;
