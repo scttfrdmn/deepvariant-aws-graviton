@@ -69,7 +69,10 @@ class Channel {
   int width_;
 
  protected:
-  learning::genomics::deepvariant::PileupImageOptions options_;
+  // A reference, not a copy: channel objects are built per read (and per
+  // reference row) from the encoder's options, which outlive them; copying the
+  // proto here was ~4 M allocations per 1 Mb (#10).
+  const learning::genomics::deepvariant::PileupImageOptions& options_;
 
   // The maximum value a pixel can have as a float. We use the 254.0
   // value as originally set in DeepVariant v1. This means our pixel
