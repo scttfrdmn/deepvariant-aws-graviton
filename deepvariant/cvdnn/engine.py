@@ -10,7 +10,8 @@ same oneDNN v2.7.3 primitives TF 2.13.1 uses, so the probabilities are
 bit-for-bit stock's (gate: the CallVariantsOutput multiset).
 
   eng = Engine(checkpoint_path, batch_size)
-  probs = eng(images)   # float32 [n, H, W, C], already (x - 128) / 128; n <= batch_size
+  probs = eng(images)   # float32 [n, H, W, C], already (x - 128) / 128, or the raw
+                        # uint8 pileups (preprocessed in libcvdnn, same arithmetic)
 
 libcvdnn.so and its libdnnl.so.2 live next to this file (DV_CVDNN_LIB overrides).
 Threads: OpenMP (OMP_NUM_THREADS; set OMP_PROC_BIND/OMP_PLACES only when the
@@ -145,6 +146,7 @@ class Engine:
     self._lib.cvdnn_open.restype = ctypes.c_void_p
     self._lib.cvdnn_open.argtypes = [ctypes.c_char_p, ctypes.c_long, ctypes.c_char_p, ctypes.c_long]
     self._lib.cvdnn_run.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p]
+    self._lib.cvdnn_run_u8.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p]
     self._lib.cvdnn_info.restype = ctypes.c_char_p
     self._lib.cvdnn_info.argtypes = [ctypes.c_void_p]
     self._lib.cvdnn_close.argtypes = [ctypes.c_void_p]
@@ -162,12 +164,14 @@ class Engine:
     self.classes = 3
 
   def __call__(self, images):
-    x = np.ascontiguousarray(images, dtype=np.float32)
+    u8 = images.dtype == np.uint8
+    x = np.ascontiguousarray(images) if u8 else np.ascontiguousarray(images, dtype=np.float32)
+    run = self._lib.cvdnn_run_u8 if u8 else self._lib.cvdnn_run
     n = x.shape[0]
     out = np.empty((n, self.classes), np.float32)
     for s0 in range(0, n, self.batch_size):  # a batch larger than planned is split
       xb = x[s0:s0 + self.batch_size]
-      rc = self._lib.cvdnn_run(self._h, xb.ctypes.data, xb.shape[0], out[s0:].ctypes.data)
+      rc = run(self._h, xb.ctypes.data, xb.shape[0], out[s0:].ctypes.data)
       if rc:
         raise RuntimeError(f'cvdnn_run failed ({rc})')
     return out

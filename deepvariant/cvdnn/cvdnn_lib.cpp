@@ -14,6 +14,8 @@
 // (spec.txt + raw float32 weights). C API:
 //   void* cvdnn_open(const char* dir, long batch, char* err, long errlen)
 //   int   cvdnn_run(void* h, const float* x, long n, float* probs)  // n <= batch
+//   int   cvdnn_run_u8(void* h, const uint8_t* x, long n, float* probs)  // raw pileup bytes;
+//         preprocessed here as call_variants does, (float(x) - 128) / 128 (exact in IEEE)
 //   long  cvdnn_batch(void* h); const char* cvdnn_info(void* h); void cvdnn_close(void* h)
 // Threads: OpenMP (OMP_NUM_THREADS, OMP_PROC_BIND / OMP_PLACES).
 #include <algorithm>
@@ -340,10 +342,16 @@ struct Net {
   }
 
   // x: n preprocessed images ((u8 - 128) / 128, NHWC float32), n <= B; probs: n x classes.
-  void infer(const float* x, long n, float* probs) {
+  void infer(const float* x, const unsigned char* u, long n, float* probs) {
     Tensor& xi = T.at(inname); Tensor& yo = T.at(outname);
     size_t E = elems(xi.nchw) / B, M = yo.nchw[1];
-    std::memcpy(xi.ptr(), x, n * E * sizeof(float));
+    if (x) {
+      std::memcpy(xi.ptr(), x, n * E * sizeof(float));
+    } else {
+      float* xp = xi.ptr();
+#pragma omp parallel for
+      for (long i = 0; i < (long)(n * E); i++) xp[i] = ((float)u[i] - 128.0f) / 128.0f;
+    }
     // Examples are independent; a partial batch is padded (gated identical on a 467-example tail).
     if (n < B) std::memset(xi.ptr() + n * E, 0, (B - n) * E * sizeof(float));
     run();
@@ -364,17 +372,20 @@ void* cvdnn_open(const char* dir, long batch, char* err, long errlen) {
   }
 }
 
-int cvdnn_run(void* h, const float* x, long n, float* probs) {
+static int run_any(void* h, const float* x, const unsigned char* u, long n, float* probs) {
   auto* net = static_cast<Net*>(h);
   if (n < 0 || n > net->B) return 1;
   try {
-    net->infer(x, n, probs);
+    net->infer(x, u, n, probs);
   } catch (const std::exception& e) {
     fprintf(stderr, "cvdnn_run: %s\n", e.what());
     return 2;
   }
   return 0;
 }
+
+int cvdnn_run(void* h, const float* x, long n, float* probs) { return run_any(h, x, nullptr, n, probs); }
+int cvdnn_run_u8(void* h, const unsigned char* x, long n, float* probs) { return run_any(h, nullptr, x, n, probs); }
 
 long cvdnn_batch(void* h) { return static_cast<Net*>(h)->B; }
 const char* cvdnn_info(void* h) { return static_cast<Net*>(h)->info.c_str(); }

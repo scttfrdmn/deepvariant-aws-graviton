@@ -4,7 +4,8 @@
   python3 patch_call_variants.py PATH/TO/deepvariant/call_variants.py
 
 DV_CV_ENGINE=cvdnn: inference through deepvariant/cvdnn (engine.py + libcvdnn.so);
-reading examples, preprocessing and writing CallVariantsOutput stay stock.
+reading examples and writing CallVariantsOutput stay stock; the (x - 128) / 128
+preprocessing moves into libcvdnn (same IEEE arithmetic, 4x less data per batch).
 Also logs the main process's peak RSS at the end (either engine).
 """
 import sys
@@ -21,10 +22,31 @@ def sub(old, new):
   s = s.replace(old, new)
 
 
+sub("""    image = tf.reshape(image, example_shape)
+    image = tf.cast(image, tf.float32)
+    image = dv_utils.preprocess_images(image, channel_indices)
+    variant = parsed_features['variant/encoded']
+""", """    image = tf.reshape(image, example_shape)
+    if not cvdnn_u8:  # DV_CV_ENGINE=cvdnn preprocesses the raw bytes itself
+      image = tf.cast(image, tf.float32)
+      image = dv_utils.preprocess_images(image, channel_indices)
+    variant = parsed_features['variant/encoded']
+""")
+sub("""  def _parse_example(example):
+    \"\"\"Parses a serialized tf.Example.\"\"\"
+""", """  cvdnn_u8 = (os.environ.get('DV_CV_ENGINE') == 'cvdnn' and not include_debug_info
+              and not channel_indices)
+
+  def _parse_example(example):
+    \"\"\"Parses a serialized tf.Example.\"\"\"
+""")
 sub("""  logging.info('example_shape: %s', example_shape)
 """, """  logging.info('example_shape: %s', example_shape)
   cvdnn_engine = None
-  if use_saved_model and os.environ.get('DV_CV_ENGINE') == 'cvdnn':
+  if os.environ.get('DV_CV_ENGINE') == 'cvdnn':
+    if not use_saved_model or include_debug_info or channel_indices or _STREAM_EXAMPLES.value:
+      raise ValueError('DV_CV_ENGINE=cvdnn needs a SavedModel, no debug info, '
+                       'no channel ablation and examples from files')
     # Same oneDNN kernels as TF, without TF's runtime (deepvariant-aws-graviton#11).
     from deepvariant.cvdnn import engine as cvdnn_lib  # pylint: disable=g-import-not-at-top
     cvdnn_engine = cvdnn_lib.Engine(checkpoint_path, batch_size)

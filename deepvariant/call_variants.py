@@ -462,6 +462,9 @@ def get_dataset(
   if debugging_true_label_mode:
     proto_features['label'] = tf.io.FixedLenFeature((1), tf.int64)
 
+  cvdnn_u8 = (os.environ.get('DV_CV_ENGINE') == 'cvdnn' and not include_debug_info
+              and not channel_indices)
+
   def _parse_example(example):
     """Parses a serialized tf.Example."""
     parsed_features = tf.io.parse_single_example(
@@ -472,8 +475,9 @@ def get_dataset(
     )
     image = tf.io.decode_raw(parsed_features['image/encoded'], tf.uint8)
     image = tf.reshape(image, example_shape)
-    image = tf.cast(image, tf.float32)
-    image = dv_utils.preprocess_images(image, channel_indices)
+    if not cvdnn_u8:  # DV_CV_ENGINE=cvdnn preprocesses the raw bytes itself
+      image = tf.cast(image, tf.float32)
+      image = dv_utils.preprocess_images(image, channel_indices)
     variant = parsed_features['variant/encoded']
     alt_allele_indices = parsed_features['alt_allele_indices/encoded']
     optional_label = None
@@ -894,7 +898,10 @@ def call_variants(
 
   logging.info('example_shape: %s', example_shape)
   cvdnn_engine = None
-  if use_saved_model and os.environ.get('DV_CV_ENGINE') == 'cvdnn':
+  if os.environ.get('DV_CV_ENGINE') == 'cvdnn':
+    if not use_saved_model or include_debug_info or channel_indices or _STREAM_EXAMPLES.value:
+      raise ValueError('DV_CV_ENGINE=cvdnn needs a SavedModel, no debug info, '
+                       'no channel ablation and examples from files')
     # Same oneDNN kernels as TF, without TF's runtime (deepvariant-aws-graviton#11).
     from deepvariant.cvdnn import engine as cvdnn_lib  # pylint: disable=g-import-not-at-top
     cvdnn_engine = cvdnn_lib.Engine(checkpoint_path, batch_size)
