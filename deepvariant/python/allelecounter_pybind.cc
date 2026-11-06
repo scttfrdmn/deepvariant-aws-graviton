@@ -48,6 +48,7 @@
 #include <pybind11/stl.h>
 
 #include "deepvariant/allelecounter.h"
+#include "third_party/nucleus/util/utils.h"
 #include "deepvariant/gvcf_blocks.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_status.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_statusor.h"
@@ -92,6 +93,26 @@ PYBIND11_MODULE(allelecounter, m) {
            })
       .def("summary_counts", &AlleleCounter::SummaryCounts)
       .def("set_light_mode", &AlleleCounter::SetLightMode, py::arg("light"))
+      // Adds every read of `reads` that overlaps `region`, in order: the
+      // Python loop `for read in in_memory_sam_reader.query(region): add(...)`
+      // in one call (deepvariant-aws-graviton#10). Returns the number added.
+      .def("add_overlapping",
+           [](AlleleCounter* self,
+              const std::vector<
+                  nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>&
+                  reads,
+              const nucleus::genomics::v1::Range& region,
+              absl::string_view sample) {
+             int n = 0;
+             for (const auto& r : reads) {
+               if (nucleus::ReadOverlapsRegion(*r.p_, region)) {
+                 self->Add(*r.p_, sample, nullptr);
+                 ++n;
+               }
+             }
+             return n;
+           },
+           py::arg("reads"), py::arg("region"), py::arg("sample"))
       .def("counts", &AlleleCounter::Counts);
 
   // gVCF blocks in C++ (deepvariant-aws-graviton): see gvcf_blocks.h.
