@@ -60,6 +60,12 @@ struct IndexedVariant {
 
 IndexedVariant EmptyIndexedVariant();
 
+// Reads Variant.reference_name and Variant.start from a serialized Variant
+// without parsing the rest (proto3: absent fields are "" / 0; for a repeated
+// singular field the last occurrence wins). Returns false on malformed input.
+bool PeekVariantNameStart(const char* data, size_t size, std::string* name,
+                          int64_t* start);
+
 // Reads Variant proto records from a single TFRecord file.
 //
 // The index of the contig each variant belongs to is returned together with it,

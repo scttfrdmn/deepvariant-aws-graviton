@@ -62,4 +62,6 @@ PYBIND11_MODULE(merge_variants, m) {
       py::arg("non_variant_file_paths"), py::arg("fasta_path"),
       py::arg("vcf_out_file_path"), py::arg("gvcf_out_file_path"),
       py::arg("header"), py::arg("ranges"), py::arg("process_somatic") = false);
+  m.def("split_non_variant_shard", &SplitNonVariantShard,
+        py::arg("input_path"), py::arg("partitions"), py::arg("output_paths"));
 }

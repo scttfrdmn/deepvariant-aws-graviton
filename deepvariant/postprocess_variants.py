@@ -32,9 +32,10 @@ import collections
 import functools
 import itertools
 import os
+import shutil
 import tempfile
 import time
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Optional, Sequence
 
 from absl import flags
 from absl import logging
@@ -1520,6 +1521,17 @@ def get_sample_name(cvo_paths: Sequence[str]) -> str:
   return sample_name
 
 
+def _split_non_variant_shard(
+    shard: str,
+    partitions: Sequence[Sequence[range_pb2.Range]],
+    output_paths: Sequence[str],
+) -> None:
+  """Pool-picklable wrapper for merge_variants.split_non_variant_shard."""
+  merge_variants.split_non_variant_shard(
+      shard, [list(p) for p in partitions], list(output_paths)
+  )
+
+
 def run_postprocess_variants_on_region(
     output_vcf: str,
     output_gvcf: str,
@@ -1529,6 +1541,7 @@ def run_postprocess_variants_on_region(
     header: variants_pb2.VcfHeader,
     is_empty: bool,
     sample_name: str,
+    nonvariant_paths: Optional[Sequence[str]] = None,
 ) -> None:
   """Runs postprocess_variants on the given partition.
 
@@ -1589,7 +1602,9 @@ def run_postprocess_variants_on_region(
     merge_variants.merge_and_write_variants_and_nonvariants(
         _ONLY_KEEP_PASS.value,
         tmp_variant_file.name,
-        tfrecord.expanded_paths_if_sharded(
+        nonvariant_paths
+        if nonvariant_paths is not None
+        else tfrecord.expanded_paths_if_sharded(
             _NONVARIANT_SITE_TFRECORD_PATH.value
         ),
         _REF.value,
@@ -1739,7 +1754,46 @@ def main(argv=()):
             num_partitions,
         )
         async_results = []
+        # Split each non-variant shard once into per-partition buckets, so a
+        # worker reads only its partition's records instead of decompressing
+        # every shard (deepvariant-aws-graviton#10). Records are unchanged and
+        # keep their shard order. DV_PP_SPLIT=0 restores the per-worker reads;
+        # DV_PP_SPLIT_DIR sets where buckets go (default: the temp dir).
+        split_paths = None
+        split_dir = None
+        if (
+            _NONVARIANT_SITE_TFRECORD_PATH.value
+            and not is_empty
+            and os.environ.get('DV_PP_SPLIT', '1') != '0'
+        ):
+          shards = tfrecord.expanded_paths_if_sharded(
+              _NONVARIANT_SITE_TFRECORD_PATH.value
+          )
+          split_dir = tempfile.mkdtemp(
+              prefix='pp_split_', dir=os.environ.get('DV_PP_SPLIT_DIR')
+          )
+          split_paths = [
+              [
+                  os.path.join(split_dir, 's%05d.p%05d.tfrecord' % (si, pi))
+                  for pi in range(num_partitions)
+              ]
+              for si in range(len(shards))
+          ]
         with multiprocessing.Pool(_CPUS.value) as pool:
+          if split_paths is not None:
+            start_time = time.time()
+            for result in [
+                pool.apply_async(
+                    _split_non_variant_shard,
+                    (shards[si], list(partitions), split_paths[si]),
+                )
+                for si in range(len(shards))
+            ]:
+              result.get()
+            logging.info(
+                'Splitting non-variant shards by partition took %s minutes',
+                (time.time() - start_time) / 60,
+            )
           for task_id in range(num_partitions):
             async_results.append(
                 pool.apply_async(
@@ -1753,11 +1807,16 @@ def main(argv=()):
                         header,
                         is_empty,
                         sample_name,
+                        None
+                        if split_paths is None
+                        else [paths[task_id] for paths in split_paths],
                     ),
                 )
             )
           pool.close()
           pool.join()
+        if split_dir is not None:
+          shutil.rmtree(split_dir, ignore_errors=True)
       else:
         logging.info(
             'Running postprocess_variants sequentially over %s partitions.',

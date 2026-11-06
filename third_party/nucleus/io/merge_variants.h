@@ -59,6 +59,17 @@ void TransfromToGvcf(Variant* variant);
 // modifies the input variant to mimic this transformation of GL -> PL -> GL.
 void ZeroScaleGl(Variant* variant);
 
+// Reads one non-variant TFRecord shard once and writes each record, unchanged,
+// to output_paths[p] (uncompressed TFRecord) for every partition p whose ranges
+// contain it under RangesContainVariant's test (reference_name equal, start in
+// [range.start, range.end)). Records keep their shard order. Records in no
+// partition are dropped, as the per-partition merge drops them.
+// (deepvariant-aws-graviton#10)
+void SplitNonVariantShard(
+    const std::string& input_path,
+    const std::vector<std::vector<nucleus::genomics::v1::Range>>& partitions,
+    const std::vector<std::string>& output_paths);
+
 void MergeAndWriteVariantsAndNonVariants(
     bool only_keep_pass, const std::string& variant_file_path,
     const std::vector<std::string>& non_variant_file_paths,

@@ -35,7 +35,12 @@
 #include <string>
 #include <vector>
 
+#include <algorithm>
+
+#include "absl/strings/match.h"
 #include "third_party/nucleus/io/reference.h"
+#include "third_party/nucleus/io/tfrecord_reader.h"
+#include "third_party/nucleus/io/tfrecord_writer.h"
 #include "third_party/nucleus/io/variant_reader.h"
 #include "third_party/nucleus/protos/range.pb.h"
 #include "third_party/nucleus/protos/struct.pb.h"
@@ -101,6 +106,63 @@ void ZeroScaleGl(Variant* variant) {
     double* gl = call->mutable_genotype_likelihood()->Mutable(i);
     *gl -= max_gl;
   }
+}
+
+void SplitNonVariantShard(
+    const std::string& input_path,
+    const std::vector<std::vector<nucleus::genomics::v1::Range>>& partitions,
+    const std::vector<std::string>& output_paths) {
+  CHECK_EQ(partitions.size(), output_paths.size());
+  struct Span {
+    int64_t start, end;
+    uint32_t partition;
+  };
+  absl::flat_hash_map<std::string, std::vector<Span>> by_contig;
+  for (uint32_t p = 0; p < partitions.size(); ++p) {
+    for (const auto& r : partitions[p]) {
+      by_contig[r.reference_name()].push_back({r.start(), r.end(), p});
+    }
+  }
+  for (auto& [name, spans] : by_contig) {
+    std::sort(spans.begin(), spans.end(),
+              [](const Span& a, const Span& b) { return a.start < b.start; });
+  }
+  std::vector<std::unique_ptr<TFRecordWriter>> writers(partitions.size());
+  for (uint32_t p = 0; p < partitions.size(); ++p) {
+    writers[p] = TFRecordWriter::New(output_paths[p], "");
+    CHECK(writers[p] != nullptr) << "cannot open " << output_paths[p];
+  }
+  std::string compression = absl::EndsWith(input_path, ".gz") ? "GZIP" : "";
+  std::unique_ptr<TFRecordReader> reader =
+      TFRecordReader::New(input_path, compression);
+  CHECK(reader != nullptr) << "cannot open " << input_path;
+  std::string name;
+  int64_t start = 0;
+  std::vector<uint32_t> hit;
+  while (reader->GetNext()) {
+    const tensorflow::tstring& rec = reader->record_ref();
+    CHECK(PeekVariantNameStart(rec.data(), rec.size(), &name, &start))
+        << "Failed to parse proto";
+    auto it = by_contig.find(name);
+    if (it == by_contig.end()) continue;
+    const std::vector<Span>& spans = it->second;
+    // Spans with span.start <= start; any of them may contain start.
+    auto ub = std::upper_bound(
+        spans.begin(), spans.end(), start,
+        [](int64_t s, const Span& sp) { return s < sp.start; });
+    hit.clear();
+    for (auto sp = spans.begin(); sp != ub; ++sp) {
+      if (sp->end > start &&
+          std::find(hit.begin(), hit.end(), sp->partition) == hit.end()) {
+        hit.push_back(sp->partition);
+      }
+    }
+    for (uint32_t p : hit) {
+      CHECK(writers[p]->WriteRecord(std::string(rec.data(), rec.size())))
+          << "write failed: " << output_paths[p];
+    }
+  }
+  for (auto& w : writers) CHECK(w->Close());
 }
 
 constexpr int kCacheSize = 300000000;

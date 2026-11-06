@@ -1253,6 +1253,10 @@ cc_library(
     hdrs = ["merge_variants.h"],
     deps = [
         ":reference",
+        ":tfrecord_reader",
+        ":tfrecord_writer",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
         ":variant_reader",
         ":vcf_writer",
         "//third_party/nucleus/protos:range_cc_pb2",

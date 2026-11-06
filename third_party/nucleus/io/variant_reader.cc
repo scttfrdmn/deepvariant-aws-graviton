@@ -125,28 +125,35 @@ bool VariantReader::GetNext() {
 // early-stop test). As in a
 // full proto3 parse, an absent field is "" / 0 and the last occurrence of a
 // singular field wins.
-int VariantReader::ClassifyCurrentRecord() const {
+bool PeekVariantNameStart(const char* data, size_t size, std::string* name,
+                          int64_t* start) {
   namespace wfl = google::protobuf::internal;
-  const tensorflow::tstring& data = internal_reader_->record_ref();
   google::protobuf::io::CodedInputStream in(
-      reinterpret_cast<const uint8_t*>(data.data()), data.size());
-  std::string name;
-  int64_t start = 0;
+      reinterpret_cast<const uint8_t*>(data), size);
+  name->clear();
+  *start = 0;
   for (uint32_t tag = in.ReadTag(); tag != 0; tag = in.ReadTag()) {
     const int field = wfl::WireFormatLite::GetTagFieldNumber(tag);
     const auto type = wfl::WireFormatLite::GetTagWireType(tag);
     if (field == 14 && type == wfl::WireFormatLite::WIRETYPE_LENGTH_DELIMITED) {
-      CHECK(wfl::WireFormatLite::ReadString(&in, &name))
-          << "Failed to parse proto";
+      if (!wfl::WireFormatLite::ReadString(&in, name)) return false;
     } else if (field == 16 && type == wfl::WireFormatLite::WIRETYPE_VARINT) {
       uint64_t v;
-      CHECK(in.ReadVarint64(&v)) << "Failed to parse proto";
-      start = static_cast<int64_t>(v);
-    } else {
-      CHECK(wfl::WireFormatLite::SkipField(&in, tag))
-          << "Failed to parse proto";
+      if (!in.ReadVarint64(&v)) return false;
+      *start = static_cast<int64_t>(v);
+    } else if (!wfl::WireFormatLite::SkipField(&in, tag)) {
+      return false;
     }
   }
+  return true;
+}
+
+int VariantReader::ClassifyCurrentRecord() const {
+  const tensorflow::tstring& data = internal_reader_->record_ref();
+  std::string name;
+  int64_t start = 0;
+  CHECK(PeekVariantNameStart(data.data(), data.size(), &name, &start))
+      << "Failed to parse proto";
   for (const auto& range : *range_filter_) {
     if (range.reference_name() == name && range.start() <= start &&
         range.end() > start) {
