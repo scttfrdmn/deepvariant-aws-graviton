@@ -31,6 +31,8 @@
  */
 #include "third_party/nucleus/io/merge_variants.h"
 
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "third_party/nucleus/io/reference.h"
@@ -147,8 +149,14 @@ void MergeAndWriteVariantsAndNonVariants(
       VariantReader::Open(variant_file_path, "", contig_index_map);
 
   // Create reader for non_variants
+  // Non-variant records outside `ranges` are dropped by the merge below; skip
+  // them in the reader from reference_name/start alone, without a full parse
+  // (deepvariant-aws-graviton#10). DV_PP_RANGE_FILTER=0 parses every record.
+  const char* rf = std::getenv("DV_PP_RANGE_FILTER");
+  const bool use_filter = !(rf != nullptr && std::string(rf) == "0");
   std::unique_ptr<ShardedVariantReader> non_variant_reader =
-      ShardedVariantReader::Open(non_variant_file_paths, contig_index_map);
+      ShardedVariantReader::Open(non_variant_file_paths, contig_index_map,
+                                 use_filter ? &ranges : nullptr);
 
   MergeAndWriteVariantsAndNonVariants(only_keep_pass, variant_reader.get(),
                                       non_variant_reader.get(),

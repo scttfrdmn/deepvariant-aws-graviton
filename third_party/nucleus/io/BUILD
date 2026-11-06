@@ -1283,6 +1283,8 @@ cc_library(
     hdrs = ["variant_reader.h"],
     deps = [
         ":tfrecord_reader",
+        "//third_party/nucleus/protos:range_cc_pb2",
+        "@com_google_protobuf//:protobuf",
         "//third_party/nucleus/protos:variants_cc_pb2",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log:check",

@@ -64,6 +64,9 @@ class TFRecordReader {
   // Return the current record contents.  Only valid after GetNext()
   // has returned true.
   tensorflow::tstring record() const { return record_; }
+  // The current record without a copy. Only valid after GetNext() returned
+  // true and until the next GetNext().
+  const tensorflow::tstring& record_ref() const { return record_; }
 
   // Close the file and release its resources.
   void Close();

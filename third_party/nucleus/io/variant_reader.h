@@ -41,6 +41,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "third_party/nucleus/io/tfrecord_reader.h"
+#include "third_party/nucleus/protos/range.pb.h"
 #include "third_party/nucleus/protos/variants.pb.h"
 
 namespace nucleus {
@@ -91,8 +92,28 @@ class VariantReader {
   // Only valid after GetNext() has returned true.
   IndexedVariant ReadRecord();
 
+  // Makes GetNext() skip records whose (reference_name, start) is in none of
+  // `ranges`, with the same test as nucleus::RangesContainVariant, reading only
+  // those two fields from the serialized record instead of parsing it. The
+  // ranges must outlive the reader. nullptr disables the filter.
+  // (deepvariant-aws-graviton#10)
+  //
+  // With the filter set, GetNext() also returns false once a record lies past
+  // the last of `ranges` (contig order, then start): shards are in sorted order
+  // (ShardedVariantReader's precondition), so no later record can be in range.
+  // DV_PP_EARLY_STOP=0 disables only this.
+  void SetRangeFilter(const std::vector<nucleus::genomics::v1::Range>* ranges);
+
  private:
+  // 1: in a range; 0: not in a range; -1: past the last range (stop).
+  int ClassifyCurrentRecord() const;
+
   std::unique_ptr<TFRecordReader> internal_reader_;
+  const std::vector<nucleus::genomics::v1::Range>* range_filter_ = nullptr;
+  // Contig index and end of the last range (in contig, then end, order);
+  // stop_contig_ < 0 disables the early stop.
+  int64_t stop_contig_ = -1;
+  int64_t stop_end_ = 0;
   absl::flat_hash_map<std::string, uint32_t> contig_index_map_;
 };
 
@@ -138,6 +159,12 @@ class ShardedVariantReader {
   static std::unique_ptr<ShardedVariantReader> Open(
       const std::vector<std::string>& shard_paths,
       absl::flat_hash_map<std::string, uint32_t>& contig_index_map);
+  // As Open, with VariantReader::SetRangeFilter(ranges) on every shard before
+  // the readers are primed. nullptr or empty ranges: no filter.
+  static std::unique_ptr<ShardedVariantReader> Open(
+      const std::vector<std::string>& shard_paths,
+      absl::flat_hash_map<std::string, uint32_t>& contig_index_map,
+      const std::vector<nucleus::genomics::v1::Range>* range_filter);
 
   IndexedVariant GetAndReadNext();
 
