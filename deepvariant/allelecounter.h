@@ -371,6 +371,18 @@ class AlleleCounter {
   // SumAlleleCounts / TotalAlleleCounts would on the full protos, including the
   // map's last-write-wins rule for a read key seen twice at one position.
   void SetLightMode(bool light) { light_ = light; }
+
+  // Two-phase track_ref_reads (deepvariant-aws-graviton#10). `src` counted the
+  // same reads with the same interval and options but no candidate positions;
+  // this counter (constructed with the candidate positions) takes src's counts
+  // and re-adds `reads` overlapping `region` only at its candidate positions.
+  // The result equals adding every read to this counter. `src` is left
+  // emptied. Returns false (nothing changed) if the counters differ in any way
+  // the derivation doesn't cover; the caller then adds reads normally.
+  bool DeriveTrackedFrom(
+      AlleleCounter* src,
+      const std::vector<nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>& reads,
+      const nucleus::genomics::v1::Range& region, absl::string_view sample);
   bool light() const { return light_; }
   std::vector<Allele> LightSumAlleleCounts(int i,
                                            bool include_low_quality = false) const;
@@ -544,6 +556,8 @@ class AlleleCounter {
                 absl::string_view bases, int* key_id);
   void LightGroup() const;
   bool light_ = false;
+  // DeriveTrackedFrom: when set, Add() changes only positions marked here.
+  const std::vector<char>* restrict_positions_ = nullptr;
   std::vector<LightRec> light_recs_;
   std::string light_bases_;
   absl::flat_hash_map<std::string, int> light_keys_;

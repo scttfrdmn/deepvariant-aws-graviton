@@ -562,6 +562,7 @@ void AlleleCounter::AddReadAllelesFast(const Read& read,
     // ReadAllele::skip() is position == -1.
     if (a.position == -1 || !IsValidIntervalOffset(a.position)) continue;
     if (i + 1 < to_add.size() && a.position == to_add[i + 1].position) continue;
+    if (restrict_positions_ && !(*restrict_positions_)[a.position]) continue;
 
     AlleleCount& allele_count = counts_[a.position];
     if (a.type == AlleleType::REFERENCE && !a.is_low_quality) {
@@ -611,6 +612,50 @@ void AlleleCounter::AddReadAllelesFast(const Read& read,
       *new_allele = allele;
     }
   }
+}
+
+bool AlleleCounter::DeriveTrackedFrom(
+    AlleleCounter* src,
+    const std::vector<nucleus::ConstProtoPtr<const Read>>& reads,
+    const Range& region, absl::string_view sample) {
+  // Same counter but for the candidate positions: everything else that
+  // AddReadAllelesFast consults must match.
+  if (src == this || light_ || src->light_ || !src->candidate_positions_.empty() ||
+      !options_.track_ref_reads() || options_.enable_methylation_aware_phasing() ||
+      options_.enable_methylation_calling() || n_reads_counted_ != 0 ||
+      src->counts_.size() != counts_.size() ||
+      interval_.SerializeAsString() != src->interval_.SerializeAsString() ||
+      reads_interval_.SerializeAsString() != src->reads_interval_.SerializeAsString() ||
+      options_.SerializeAsString() != src->options_.SerializeAsString() ||
+      ref_bases_ != src->ref_bases_)
+    return false;
+  // Candidate positions (relative after Init) keep this counter's fresh,
+  // just-initialized AlleleCount; every other position takes src's.
+  std::vector<char> mark(counts_.size(), 0);
+  for (int p : candidate_positions_)
+    if (p >= 0 && p < static_cast<int>(counts_.size())) mark[p] = 1;
+  for (size_t p = 0; p < counts_.size(); ++p)
+    if (mark[p]) std::swap(counts_[p], src->counts_[p]);
+  counts_.swap(src->counts_);
+  // Re-add the reads, changing only candidate positions. A read's alleles lie
+  // in [start - 1, end) relative to the interval (indels sit on the preceding
+  // base), so reads with no candidate position in [start - 2, end + 1) can't
+  // change a marked position and are skipped.
+  std::vector<int> cand(candidate_positions_.begin(), candidate_positions_.end());
+  std::sort(cand.begin(), cand.end());
+  restrict_positions_ = &mark;
+  for (const auto& r : reads) {
+    if (!nucleus::ReadOverlapsRegion(*r.p_, region)) continue;
+    const int64_t s0 = r.p_->alignment().position().position() - interval_.start() - 2;
+    const int64_t e0 = nucleus::ReadEnd(*r.p_) - interval_.start() + 1;
+    auto it = std::lower_bound(cand.begin(), cand.end(), s0);
+    if (it == cand.end() || *it >= e0) continue;
+    Add(*r.p_, sample, nullptr);
+  }
+  restrict_positions_ = nullptr;
+  n_reads_counted_ = src->n_reads_counted_;
+  src->counts_.clear();
+  return true;
 }
 
 // Convenience function to check if operations is match. Note, that we treat

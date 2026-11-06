@@ -113,6 +113,9 @@ PYBIND11_MODULE(allelecounter, m) {
              return n;
            },
            py::arg("reads"), py::arg("region"), py::arg("sample"))
+      .def("derive_tracked_from", &AlleleCounter::DeriveTrackedFrom,
+           py::arg("src"), py::arg("reads"), py::arg("region"),
+           py::arg("sample"))
       .def("counts", &AlleleCounter::Counts);
 
   // gVCF blocks in C++ (deepvariant-aws-graviton): see gvcf_blocks.h.

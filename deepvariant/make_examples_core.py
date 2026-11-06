@@ -1372,6 +1372,7 @@ class OutputsWriter:
 
 # Allele-counting loops in C++ (deepvariant-aws-graviton#10); DV_COUNT_PY=1 off.
 _CPP_COUNT_LOOPS = not os.environ.get('DV_COUNT_PY')
+_DERIVE_TRACKED = os.environ.get('DV_DERIVE', '1') != '0'
 
 class RegionProcessor:
   """Creates DeepVariant example protos for a single region on the genome.
@@ -2708,9 +2709,28 @@ class RegionProcessor:
             and not sample.options.skip_normalization
         ):
           # Same reads, same order as iterating sample.reads (the query above).
-          sample.allele_counter.add_overlapping(
-              sample.in_memory_sam_reader.reads, region, sample.options.name
+          # Single sample with track_ref_reads: derive from the positions
+          # counter (same reads, options and interval) instead of recounting;
+          # only candidate positions are re-added (#10). DV_DERIVE=0 off.
+          positions_counter = allele_counters.get(sample.options.name)
+          derived = (
+              _DERIVE_TRACKED
+              and len(self.samples) == 1
+              and padded_region is None
+              and self.options.allele_counter_options.track_ref_reads
+              and positions_counter is not None
+              and positions_counter is not sample.allele_counter
+              and sample.allele_counter.derive_tracked_from(
+                  positions_counter,
+                  sample.in_memory_sam_reader.reads,
+                  region,
+                  sample.options.name,
+              )
           )
+          if not derived:
+            sample.allele_counter.add_overlapping(
+                sample.in_memory_sam_reader.reads, region, sample.options.name
+            )
         for read in (() if _CPP_COUNT_LOOPS and not (
             self.options.allele_counter_options.normalize_reads
             and not sample.options.skip_normalization
