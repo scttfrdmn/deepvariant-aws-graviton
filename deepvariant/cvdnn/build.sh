@@ -19,7 +19,7 @@ mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
 rm -rf "$OUT/cv-perf" "$OUT/lib"; mkdir -p "$OUT/lib"
 docker run --rm -u 0:0 -v "$SRC:/src:ro" -v "$OUT:/out" --entrypoint bash "$IMAGE" -c '
 set -euo pipefail
-apt-get -qq update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get -qq -y install cmake ninja-build git >/dev/null
+apt-get -qq update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get -qq -y install cmake ninja-build git unzip >/dev/null
 git clone -q --depth 1 -b v2.7.3 https://github.com/uxlfoundation/oneDNN.git /tmp/onednn
 cd /tmp/onednn && git apply /src/tools/cv_onednn/onednn-v2.7.3-brgconv-channel-slice-dst.patch
 cmake -G Ninja -S . -B b -DCMAKE_BUILD_TYPE=Release -DDNNL_CPU_RUNTIME=OMP -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF >/dev/null
@@ -29,7 +29,8 @@ TFINC=$(python3 -c "import os, tensorflow as tf; print(os.path.join(os.path.dirn
 g++ -O2 -mavx -fopenmp -std=c++17 -fPIC -shared -I/tmp/onednn/include -I/tmp/onednn/b/include -I"$TFINC" \
   -o /out/lib/libcvdnn.so /src/deepvariant/cvdnn/cvdnn_lib.cpp -L/tmp/onednn/b/src -ldnnl -Wl,-rpath,"\$ORIGIN"
 cp -L /tmp/onednn/b/src/libdnnl.so.2 /out/lib/
-mkdir -p /out/cv-perf && cd /out/cv-perf && python3 -c "import zipfile; zipfile.ZipFile(\"/opt/deepvariant/bin/call_variants.zip\").extractall(\".\")"
+# unzip, not zipfile: the zip stores symlinks (e.g. the nucleus .so files)
+mkdir -p /out/cv-perf && cd /out/cv-perf && unzip -q /opt/deepvariant/bin/call_variants.zip
 sed -i "/^def IsRunningFromZip():/{n;s/return True/return False/}" __main__.py
 ln -s runfiles __main__.py.runfiles
 D=runfiles/com_google_deepvariant/deepvariant
