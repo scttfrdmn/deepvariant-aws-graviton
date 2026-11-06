@@ -646,6 +646,43 @@ def load_model_and_check_shape(
 
   if use_saved_model:
     model = tf.saved_model.load(checkpoint_path)
+    if os.environ.get('DV_CV_GRAPPLER_OFF'):
+      tf.config.optimizer.set_experimental_options(
+          {k: False for k in os.environ['DV_CV_GRAPPLER_OFF'].split(',')})
+      logging.info('call_variants: grappler off: %s', os.environ['DV_CV_GRAPPLER_OFF'])
+    if os.environ.get('DV_CV_FROZEN'):
+      # Variables as constants so oneDNN conv can cache its reordered filters
+      # (deepvariant-aws-graviton#11). Gate: CVO records identical.
+      from tensorflow.python.framework import convert_to_constants
+      _fz = convert_to_constants.convert_variables_to_constants_v2(
+          model.signatures['serving_default'])
+      model._dv_frozen = _fz
+      if os.environ.get('DV_CV_FROZEN') == 'conv':
+        # Only conv filters as constants: MatMul weights keep a non-Const
+        # input, so oneDNN keeps the stock inner-product kernel (exactness).
+        _gd = _fz.graph.as_graph_def()
+        _n = 0
+        for _node in list(_gd.node):
+          if _node.op in ('MatMul', 'BatchMatMulV2'):
+            _w = _node.input[1]
+            _id = _gd.node.add()
+            _id.name = _w.split(':')[0].replace('^', '') + '/_dv_nofold%d' % _n
+            _id.op = 'PlaceholderWithDefault'
+            _id.input.append(_w)
+            _id.attr['dtype'].type = _node.attr['T'].type
+            _id.attr['shape'].shape.unknown_rank = True
+            _node.input[1] = _id.name
+            _n += 1
+        _in = [t.name for t in _fz.inputs]
+        _out = [t.name for t in _fz.outputs]
+        def _imp():
+          tf.compat.v1.import_graph_def(_gd, name='')
+        _w2 = tf.compat.v1.wrap_function(_imp, [])
+        model._dv_frozen = _w2.prune(
+            feeds=[_w2.graph.get_tensor_by_name(x) for x in _in],
+            fetches=[_w2.graph.get_tensor_by_name(x) for x in _out])
+        logging.info('call_variants: frozen conv filters only (%d matmul weights kept non-const)', _n)
+      logging.info('call_variants: using frozen serving function')
     model_example_info_json = f'{checkpoint_path}/example_info.json'
     model_example_shape, _, channel_indices = (
         dv_utils.get_shape_and_channels_from_json(model_example_info_json)
@@ -889,8 +926,13 @@ def call_variants(
     # These elements per iteration are read from the `get_dataset` function,
     # specifically the `_parse_example` function within it.
     if use_saved_model:
-      predictions = model.signatures['serving_default'](images_in_batch)
-      predictions = predictions['classification'].numpy()
+      _frozen = getattr(model, '_dv_frozen', None)
+      if _frozen is not None:
+        predictions = _frozen(images_in_batch)
+        predictions = (predictions['classification'] if isinstance(predictions, dict) else predictions[0]).numpy()
+      else:
+        predictions = model.signatures['serving_default'](images_in_batch)
+        predictions = predictions['classification'].numpy()
     else:
       if not is_gpu_available:
         # This is faster on CPU but slower on GPU.
