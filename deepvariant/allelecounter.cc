@@ -38,6 +38,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -295,6 +296,22 @@ int32_t GetMethylationLevel(const Read& read, int offset) {
       static_cast<unsigned char>(modifications[offset]));
 }
 
+namespace {
+const bool kNoCountPool = std::getenv("DV_COUNT_POOL") != nullptr &&
+                          std::string(std::getenv("DV_COUNT_POOL")) == "0";
+}  // namespace
+
+std::vector<std::vector<AlleleCount>>& AlleleCounter::CountPool() {
+  thread_local std::vector<std::vector<AlleleCount>> pool;
+  return pool;
+}
+
+void AlleleCounter::ReturnToCountPool(std::vector<AlleleCount>* counts) {
+  if (kNoCountPool || counts->empty() || CountPool().size() >= 8) return;
+  CountPool().push_back(std::move(*counts));
+  counts->clear();
+}
+
 void AlleleCounter::Init() {
   // Initialize our counts vector of AlleleCounts with proper position and
   // reference base information. Initially the alleles repeated field is empty.
@@ -310,8 +327,32 @@ void AlleleCounter::Init() {
   full_interval_offset = std::max(full_interval_offset, 0L);
   // Built in place: same fields as MakePosition (reverse_strand false is the
   // proto3 default) without a temporary Position and a copy of each
-  // AlleleCount (#10).
-  for (int i = 0; i < len; ++i) {
+  // AlleleCount (#10). Storage from an earlier counter is reused: every field
+  // of AlleleCount (and of its Position) is reset to the fresh value, so each
+  // entry equals a newly constructed one, without reallocating its
+  // sub-message and strings.
+  int i = 0;
+  if (!CountPool().empty()) {
+    counts_ = std::move(CountPool().back());
+    CountPool().pop_back();
+    if (counts_.size() > static_cast<size_t>(len)) counts_.resize(len);
+    for (; i < static_cast<int>(counts_.size()); ++i) {
+      AlleleCount& allele_count = counts_[i];
+      const int64_t pos = interval_.start() + i;
+      auto* position = allele_count.mutable_position();
+      position->set_reference_name(interval_.reference_name());
+      position->set_position(pos);
+      position->set_reverse_strand(false);
+      allele_count.set_ref_base(ref_bases_.data() + i + full_interval_offset, 1);
+      allele_count.set_ref_supporting_read_count(0);
+      allele_count.mutable_read_alleles()->clear();
+      allele_count.set_ref_nonconfident_read_count(0);
+      allele_count.mutable_sample_alleles()->clear();
+      allele_count.set_track_ref_reads(options_.track_ref_reads());
+    }
+    counts_.reserve(len);
+  }
+  for (; i < len; ++i) {
     AlleleCount& allele_count = counts_.emplace_back();
     const int64_t pos = interval_.start() + i;
     auto* position = allele_count.mutable_position();
@@ -335,6 +376,8 @@ AlleleCounter* AlleleCounter::InitFromAlleleCounts(
 // This constructor is only used for unit testing, therefore it is defined as
 // private.
 AlleleCounter::AlleleCounter() : ref_(nullptr) {}
+
+AlleleCounter::~AlleleCounter() { ReturnToCountPool(&counts_); }
 
 AlleleCounter::AlleleCounter(const GenomeReference* const ref,
                              const Range& range,
@@ -654,6 +697,7 @@ bool AlleleCounter::DeriveTrackedFrom(
   }
   restrict_positions_ = nullptr;
   n_reads_counted_ = src->n_reads_counted_;
+  ReturnToCountPool(&src->counts_);
   src->counts_.clear();
   return true;
 }

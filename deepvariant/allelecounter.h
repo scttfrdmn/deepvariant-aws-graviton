@@ -266,6 +266,9 @@ class ReadAllele {
 // DELETION allele will be dropped.
 class AlleleCounter {
  public:
+  // Returns this counter's per-position AlleleCount storage to a per-thread
+  // pool that the next counter's Init() reuses (#10).
+  ~AlleleCounter();
   // Creates an AlleleCounter.
   //
   // The counter will track AlleleCounts over the interval range, using ref to
@@ -541,6 +544,8 @@ class AlleleCounter {
 
   // Our AlleleCount objects, one for each base in our interval, in order.
   std::vector<AlleleCount> counts_;
+  static std::vector<std::vector<AlleleCount>>& CountPool();
+  static void ReturnToCountPool(std::vector<AlleleCount>* counts);
 
   // Counts-only mode storage.
   struct LightRec {
