@@ -428,7 +428,8 @@ CigarUnit::Operation CigarOperationFromChar(char op) {
   }
 }
 
-std::list<CigarOp> CigarStringToVector(absl::string_view cigar) {
+namespace {
+std::list<CigarOp> CigarStringToVectorRe2(absl::string_view cigar) {
   std::list<CigarOp> cigarOps;
   absl::string_view input(cigar);
   RE2 pattern("(\\d+)([XIDS=])");
@@ -438,6 +439,33 @@ std::list<CigarOp> CigarStringToVector(absl::string_view cigar) {
     CHECK_EQ(opType.length(), 1);
     CigarUnit::Operation op = CigarOperationFromChar(opType[0]);
     cigarOps.push_back(CigarOp(op, opLen));
+  }
+  return cigarOps;
+}
+const bool kCigarRe2 = std::getenv("DV_CIGAR_RE2") != nullptr;
+}  // namespace
+
+// The same as repeatedly RE2::Consume-ing "(\d+)([XIDS=])" from the start
+// (stop at the first token that doesn't match), without compiling a regex per
+// call (deepvariant-aws-graviton#10). DV_CIGAR_RE2=1 uses RE2.
+std::list<CigarOp> CigarStringToVector(absl::string_view cigar) {
+  if (kCigarRe2) return CigarStringToVectorRe2(cigar);
+  std::list<CigarOp> cigarOps;
+  size_t i = 0;
+  const size_t n = cigar.size();
+  while (i < n) {
+    size_t j = i;
+    int64_t len = 0;
+    while (j < n && cigar[j] >= '0' && cigar[j] <= '9') {
+      len = len * 10 + (cigar[j] - '0');
+      if (len > INT32_MAX) return CigarStringToVectorRe2(cigar);  // RE2's int parse fails here
+      ++j;
+    }
+    if (j == i || j >= n) break;
+    const char c = cigar[j];
+    if (c != 'X' && c != 'I' && c != 'D' && c != 'S' && c != '=') break;
+    cigarOps.push_back(CigarOp(CigarOperationFromChar(c), static_cast<int>(len)));
+    i = j + 1;
   }
   return cigarOps;
 }
