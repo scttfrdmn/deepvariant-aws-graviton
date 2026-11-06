@@ -893,6 +893,12 @@ def call_variants(
     )
 
   logging.info('example_shape: %s', example_shape)
+  cvdnn_engine = None
+  if use_saved_model and os.environ.get('DV_CV_ENGINE') == 'cvdnn':
+    # Same oneDNN kernels as TF, without TF's runtime (deepvariant-aws-graviton#11).
+    from deepvariant.cvdnn import engine as cvdnn_lib  # pylint: disable=g-import-not-at-top
+    cvdnn_engine = cvdnn_lib.Engine(checkpoint_path, batch_size)
+    logging.info('call_variants: DV_CV_ENGINE=cvdnn (%d ops): %s', cvdnn_engine.n_ops, cvdnn_engine.info)
   enc_image_variant_alt_allele_ds = get_dataset(
       examples_filename,
       example_shape,
@@ -925,7 +931,9 @@ def call_variants(
   ) in enc_image_variant_alt_allele_ds:
     # These elements per iteration are read from the `get_dataset` function,
     # specifically the `_parse_example` function within it.
-    if use_saved_model:
+    if cvdnn_engine is not None:
+      predictions = cvdnn_engine(images_in_batch.numpy())
+    elif use_saved_model:
       _frozen = getattr(model, '_dv_frozen', None)
       if _frozen is not None:
         predictions = _frozen(images_in_batch)
@@ -995,6 +1003,9 @@ def call_variants(
         pileup_curation_in_batch,
     ))
 
+  import resource  # pylint: disable=g-import-not-at-top
+  logging.info('call_variants: peak RSS %.2f GB (main process)',
+               resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6)
   # Put none values in each queue so the running processes can terminate.
   for queue in writer_queues:
     queue.put(None)
