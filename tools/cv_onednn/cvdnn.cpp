@@ -8,7 +8,8 @@
 //   --reorder-each   re-reorder every filter on every run (TF stock behaviour)
 //   --pool-inf       max pool as forward_inference (no workspace)
 //   --concat-direct  convs write straight into their channel slice of the
-//                    concat output (strided dst); refuses if the impl changes
+//                    concat output (strided nhwc dst; needs brgconv to accept
+//                    it, see patch_ld.py); other concat inputs are copied
 //   --rsqrt eigen|div  BN rsqrt like TF (Eigen, AVX) or 1/sqrtf
 //
 //   cvdnn DIR [--reps N] [options]   (OMP_NUM_THREADS sets threads)
@@ -24,7 +25,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <set>
+#include <tuple>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -65,8 +69,7 @@ struct Tensor {
   size_t off = 0;     // channel offset in a concat buffer (concat-direct)
   memory::dim ctot = 0;  // channel stride
   float* ptr() { return buf->data() + off; }
-  // memory handle: a submemory desc carries the channel offset itself
-  float* handle() { return ctot == nchw[1] ? ptr() : buf->data(); }
+  float* handle() { return ptr(); }  // strided descs carry no offset0
 };
 
 struct Op {
@@ -138,8 +141,9 @@ int main(int argc, char** argv) {
   auto md_of = [&](const std::string& n) {
     Tensor& t = T.at(n);
     if (t.ctot == t.nchw[1]) return memory::desc(t.nchw, dt::f32, tag::nhwc);
-    memory::desc full({t.nchw[0], t.ctot, t.nchw[2], t.nchw[3]}, dt::f32, tag::nhwc);
-    return full.submemory_desc(t.nchw, {0, (memory::dim)t.off, 0, 0});
+    // channel slice of a wider nhwc tensor; the handle points at the slice's first channel
+    const auto H = t.nchw[2], W = t.nchw[3], L = t.ctot;
+    return memory::desc(t.nchw, dt::f32, memory::dims{H * W * L, 1, W * L, L});
   };
   std::vector<Op> ops;
   std::vector<float> in;
@@ -172,13 +176,26 @@ int main(int argc, char** argv) {
       shp[w[1]] = shp.at(w[2]);
     } else if (w[0] == "output") outname = w[1];
   }
+  // concat-direct: a conv output whose only consumer is one concat is written in place.
+  std::map<std::string, int> uses; std::set<std::string> conv_out;
+  for (auto& w : lines) {
+    if (w[0] == "conv") conv_out.insert(w[1]);
+    if (w[0] == "conv" || w[0] == "gap" || w[0] == "fc" || w[0] == "softmax") uses[w[2]]++;
+    else if (w[0] == "pool") uses[w[3]]++;
+    else if (w[0] == "concat") for (size_t k = 2; k < w.size(); k++) uses[w[k]]++;
+  }
+  std::map<std::string, std::pair<std::string, memory::dim>> slot;  // concat input -> (concat, channel offset)
   for (auto& w : lines)
-    if (w[0] == "concat" && concat_direct) {
+    if (w[0] == "concat") {
       memory::dim c = 0;
-      for (size_t k = 2; k < w.size(); k++) { slice[w[k]] = {w[1], c}; c += shp.at(w[k])[1]; }
+      for (size_t k = 2; k < w.size(); k++) {
+        slot[w[k]] = {w[1], c};
+        if (concat_direct && conv_out.count(w[k]) && uses[w[k]] == 1) slice[w[k]] = {w[1], c};
+        c += shp.at(w[k])[1];
+      }
     }
   auto elems = [](const memory::dims& d) { return (size_t)(d[0] * d[1] * d[2] * d[3]); };
-  if (reuse && slice.empty()) {
+  if (reuse) {
     // Liveness plan in execution order: a tensor takes the smallest free buffer that
     // fits (else a new one) and returns it after its last consumer has run; an op's
     // inputs are released only after its output is placed (no in-place aliasing).
@@ -191,7 +208,9 @@ int main(int argc, char** argv) {
     }
     for (size_t k = 0; k < seq.size(); k++) for (auto& i : seq[k].second) last[i] = k;
     std::vector<size_t> cap; std::vector<int> freel; std::map<std::string, int> bid;
-    auto place = [&](const std::string& n) {
+    std::function<void(const std::string&)> place = [&](const std::string& n) {
+      if (bid.count(n)) return;
+      if (slice.count(n)) { place(slice.at(n).first); bid[n] = bid.at(slice.at(n).first); return; }
       size_t need = elems(shp.at(n)); int best = -1;
       for (int b : freel) if (cap[b] >= need && (best < 0 || cap[b] < cap[best])) best = b;
       if (best < 0) for (int b : freel) if (best < 0 || cap[b] > cap[best]) best = b;  // grow the largest
@@ -203,22 +222,28 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < seq.size(); k++) {
       place(seq[k].first);
       for (auto& i : seq[k].second)
-        if (last[i] == k && i != outname && i != inname && std::find(freel.begin(), freel.end(), bid[i]) == freel.end()) freel.push_back(bid[i]);
+        if (last[i] == k && i != outname && i != inname && !slice.count(i) &&
+            std::find(freel.begin(), freel.end(), bid[i]) == freel.end()) freel.push_back(bid[i]);
     }
     std::vector<std::shared_ptr<std::vector<float>>> bufs;
     size_t tot = 0;
     for (size_t c : cap) { bufs.push_back(std::make_shared<std::vector<float>>(c)); tot += c; }
-    for (auto& [n, d] : shp) { Tensor t; t.nchw = d; t.ctot = d[1]; t.buf = bufs[bid.at(n)]; T[n] = t; }
+    for (auto& [n, d] : shp) {
+      Tensor t; t.nchw = d; t.ctot = d[1]; t.buf = bufs[bid.at(n)];
+      if (slice.count(n)) { t.off = slice.at(n).second; t.ctot = shp.at(slice.at(n).first)[1]; }
+      T[n] = t;
+    }
     fprintf(stderr, "plan: %zu buffers, %.2f GB (no reuse: %.2f GB)\n", cap.size(), tot * 4e-9,
             [&] { size_t a = 0; for (auto& [n, d] : shp) a += elems(d); return a * 4e-9; }());
-  } else
+  } else {
     for (auto& [n, d] : shp) {
       if (slice.count(n)) continue;
       alloc(n, d);
     }
-  for (auto& [n, sl] : slice) {
-    Tensor t; t.nchw = shp.at(n); t.buf = T.at(sl.first).buf; t.off = sl.second; t.ctot = shp.at(sl.first)[1];
-    T[n] = t;
+    for (auto& [n, sl] : slice) {
+      Tensor t; t.nchw = shp.at(n); t.buf = T.at(sl.first).buf; t.off = sl.second; t.ctot = shp.at(sl.first)[1];
+      T[n] = t;
+    }
   }
   if (images.empty()) {
     auto d = shp.at(inname);
@@ -317,7 +342,8 @@ int main(int argc, char** argv) {
     } else if (w[0] == "concat") {
       op.out = w[1];
       op.ins.assign(w.begin() + 2, w.end());
-      op.impl = concat_direct ? "direct (in place)" : "copy";
+      int nd = 0; for (auto& n : op.ins) nd += slice.count(n);
+      op.impl = concat_direct ? "direct " + std::to_string(nd) + "/" + std::to_string(op.ins.size()) : "copy";
     } else continue;
     ops.push_back(std::move(op));
   }
@@ -342,16 +368,16 @@ int main(int argc, char** argv) {
         continue;
       }
       if (op.kind == "concat") {
-        if (concat_direct) continue;
         Tensor& o = T.at(op.out);
         long N = o.nchw[0], P = o.nchw[2] * o.nchw[3], C = o.nchw[1];
-        std::vector<std::pair<float*, long>> src;
-        for (auto& n : op.ins) src.push_back({T.at(n).ptr(), T.at(n).nchw[1]});
+        std::vector<std::tuple<float*, long, long>> src;  // (src, channels, dst channel offset); in-place inputs skipped
+        for (auto& n : op.ins)
+          if (!slice.count(n)) src.push_back({T.at(n).ptr(), T.at(n).nchw[1], slot.at(n).second});
         float* dst = o.ptr();
+        if (!src.empty()) {
 #pragma omp parallel for
-        for (long p = 0; p < N * P; p++) {
-          float* d = dst + p * C;
-          for (auto& [sp, c] : src) { std::memcpy(d, sp + p * c, c * sizeof(float)); d += c; }
+          for (long p = 0; p < N * P; p++)
+            for (auto& [sp, c, co] : src) std::memcpy(dst + p * C + co, sp + p * c, c * sizeof(float));
         }
         if (profile) prof[op.kind] += std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count();
         continue;
@@ -435,6 +461,7 @@ int main(int argc, char** argv) {
   size_t diff = 0; double mx = 0;
   for (size_t i = 0; i < n; i++)
     if (std::memcmp(&ref[i], o.ptr() + i, 4)) { diff++; mx = std::max(mx, (double)std::fabs(ref[i] - o.ptr()[i])); }
+  if (getenv("CVDNN_DUMP")) std::ofstream(D + "/out.f32", std::ios::binary).write(reinterpret_cast<char*>(o.ptr()), n * 4);
   printf("span wall median=%.4fs min=%.4fs reps=%d  %s", ts[ts.size() / 2], ts[0], reps,
          diff ? "DIFFER" : "IDENTICAL");
   if (diff) printf(" elems=%zu/%zu maxabs=%.3g", diff, n, mx);

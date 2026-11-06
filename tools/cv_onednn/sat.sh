@@ -16,7 +16,7 @@ for r in $(seq $REPS); do
     if [[ $E == tf ]]; then
       TF_CPP_MIN_LOG_LEVEL=2 taskset -c $c $D/ox/tf2.13.1/bin/python $D/ie/run.py $D/ie/dump sat-$p tf $D/ie/models/wgs --limit 8192 --threads $T --start-at $at 2>/dev/null | grep "^{" >> sat-$E.out &
     else
-      OMP_NUM_THREADS=$T OMP_PROC_BIND=${BIND:-close} OMP_PLACES=cores taskset -c $c ./cvdnn net --images $D/ie/dump --n 8192 --start-at $at 2>/dev/null | grep network >> sat-$E.out &
+      OMP_NUM_THREADS=$T OMP_PROC_BIND=${BIND:-close} OMP_PLACES=cores taskset -c $c ${BIN:-./cvdnn} net --images $D/ie/dump --n 8192 --start-at $at ${DNN_ARGS:-} 2>/dev/null | grep network >> sat-$E.out &
     fi
     pids+=($!)
   done

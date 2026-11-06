@@ -1,0 +1,32 @@
+--- a/hack/ie/run.py
++++ b/hack/ie/run.py
+@@ -16,6 +16,7 @@
+ ap.add_argument("dump"); ap.add_argument("label"); ap.add_argument("engine"); ap.add_argument("model")
+ ap.add_argument("--threads", type=int, default=0); ap.add_argument("--inter", type=int, default=0); ap.add_argument("--ep", default="cpu")
+ ap.add_argument("--precision", default="f32"); ap.add_argument("--limit", type=int, default=0)
++ap.add_argument("--start-at", type=float, default=0, help="epoch seconds: wait until then before the timed loop (concurrent runs)")
+ a = ap.parse_args()
+ info = json.load(open(os.path.join(a.dump, "info.json")))
+ H, W, C = info["shape"]; n = info["n"] if not a.limit else min(a.limit, info["n"]); B = info["batch"]
+@@ -60,13 +61,19 @@
+ # Only the engine call is timed (wall and process CPU); input decode and
+ # preprocessing are identical across engines and excluded.
+ wall = cpu = 0.0
++pre = None
++if a.start_at:  # concurrent runs: preprocess every batch first so the window holds only inference
++  pre = [((imgs[s0:s0 + B].astype(np.float32) - np.float32(128.0)) / np.float32(128.0)) for s0 in range(0, n, B)]
++  time.sleep(max(0.0, a.start_at - time.time()))
++t_start = time.time()
+ for s0 in range(0, n, B):
+-  x = (imgs[s0:s0 + B].astype(np.float32) - np.float32(128.0)) / np.float32(128.0)
++  x = pre[s0 // B][:n - s0] if pre is not None else (imgs[s0:s0 + B].astype(np.float32) - np.float32(128.0)) / np.float32(128.0)
+   r0 = resource.getrusage(resource.RUSAGE_SELF); t0 = time.perf_counter()
+   out[s0:s0 + x.shape[0]] = infer(x)
+   wall += time.perf_counter() - t0; r1 = resource.getrusage(resource.RUSAGE_SELF)
+   cpu += (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
++t_end = time.time()
+ np.save(os.path.join(a.dump, f"probs_{a.label}.npy"), out)
+-t = dict(label=a.label, engine=a.engine, version=version, n=n, wall_s=wall, cpu_s=cpu, ex_per_s=n / wall, cpu_ms_per_ex=1000 * cpu / n, threads=a.threads, inter=a.inter, env={k: v for k, v in os.environ.items() if k.startswith(("OMP_", "ZEN", "TF_", "ONEDNN", "KMP_", "GOMP"))}, ep=a.ep, precision=a.precision)
++t = dict(label=a.label, engine=a.engine, version=version, n=n, wall_s=wall, cpu_s=cpu, ex_per_s=n / wall, cpu_ms_per_ex=1000 * cpu / n, threads=a.threads, inter=a.inter, env={k: v for k, v in os.environ.items() if k.startswith(("OMP_", "ZEN", "TF_", "ONEDNN", "KMP_", "GOMP"))}, ep=a.ep, precision=a.precision, t_start=t_start, t_end=t_end)
+ json.dump(t, open(os.path.join(a.dump, f"timing_{a.label}.json"), "w"), indent=1)
+ print(json.dumps(t))
