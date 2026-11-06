@@ -51,6 +51,15 @@ GENOTYPE_BY_ENCODING = {
 }
 
 
+def _dense_stack_forward(stack, batch):
+  """Keras' eager Sequential-of-Dense forward pass, op for op."""
+  x = tf.cast(tf.convert_to_tensor(batch), tf.float32)
+  for kernel, bias, activation in stack:
+    x = tf.matmul(x, kernel)
+    x = tf.nn.bias_add(x, bias)
+    x = tf.nn.relu(x) if activation == 'relu' else tf.nn.softmax(x, axis=-1)
+  return x
+
 class SmallModelVariantCaller:
   """Class responsible for calling variants on candidate examples.
 
@@ -143,7 +152,11 @@ class SmallModelVariantCaller:
     for i in range(0, len(examples), self.batch_size):
       batch = examples[i : i + self.batch_size]
       if len(batch) < self.batch_size:
-        out = self.classifier(batch, training=False)
+        stack = self._dense_stack()
+        if stack is not None:
+          out = _dense_stack_forward(stack, batch)
+        else:
+          out = self.classifier(batch, training=False)
         if getattr(out, 'dtype', None) == tf.float32 and not os.environ.get(
             'DV_SMALL_MODEL_EAGER'
         ):
@@ -159,6 +172,42 @@ class SmallModelVariantCaller:
         predictions.extend(rows)
         eager.extend([False] * len(rows))
     return predictions, eager
+
+  def _dense_stack(self):
+    """The classifier as (kernel, bias, activation) per Dense layer, or None.
+
+    For a Sequential of float32 Dense layers with bias, ReLU hidden layers and a
+    softmax output, an eager call is: cast to float32, then per layer
+    tf.matmul, tf.nn.bias_add and tf.nn.relu / tf.nn.softmax(axis=-1). That is
+    what Keras' eager __call__ runs (deepvariant-aws-graviton#10); calling the
+    same ops directly skips the per-call Keras machinery. DV_SMALL_MODEL_KERAS=1
+    keeps the Keras call.
+    """
+    if hasattr(self, '_stack_cache'):
+      return self._stack_cache
+    stack = None
+    try:
+      layers = list(self.classifier.layers)
+      if (
+          not os.environ.get('DV_SMALL_MODEL_KERAS')
+          and type(self.classifier).__name__ == 'Sequential'
+          and layers
+          and all(
+              type(l).__name__ == 'Dense'
+              and l.use_bias
+              and l.dtype == 'float32'
+              and l.compute_dtype == 'float32'
+              for l in layers
+          )
+          and all(l.activation.__name__ == 'relu' for l in layers[:-1])
+          and layers[-1].activation.__name__ == 'softmax'
+          and all(len(l.kernel.shape) == 2 for l in layers)
+      ):
+        stack = [(l.kernel, l.bias, l.activation.__name__) for l in layers]
+    except AttributeError:
+      stack = None
+    self._stack_cache = stack
+    return stack
 
   def _eager_row_passes(self, candidate, alt_allele_indices, row) -> bool:
     """_accept_call_result for a float32 row as if it were an EagerTensor.
