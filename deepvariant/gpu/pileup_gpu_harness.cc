@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <string>
 #include <tuple>
@@ -237,11 +238,14 @@ static size_t Diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s DUMP.bin [--tfrecord_images FILE] [--reps N]\n", argv[0]); return 1; }
-  const char* tfimg = nullptr; int reps = 5;
+  const char* tfimg = nullptr; int reps = 5; double gpu_seconds = 0;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--tfrecord_images") && i + 1 < argc) tfimg = argv[++i];
     else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--stable")) g_stable = true;
+    // --gpu_seconds S: after the timed reps, keep the kernels running back to
+    // back for S seconds so 1 Hz DCGM sampling (tach) sees a steady state.
+    else if (!strcmp(argv[i], "--gpu_seconds") && i + 1 < argc) gpu_seconds = atof(argv[++i]);
   }
   auto t0 = std::chrono::steady_clock::now();
   Capture cap = Load(argv[1]);
@@ -300,6 +304,25 @@ int main(int argc, char** argv) {
     CK(gpuEventSynchronize(e2)); CK(gpuGetLastError());
     float a, b; CK(gpuEventElapsedTime(&a, e0, e1)); CK(gpuEventElapsedTime(&b, e1, e2));
     if (r > 0) { best_enc = std::min(best_enc, a); best_asm = std::min(best_asm, b); }
+  }
+  if (gpu_seconds > 0) {
+    auto utc = [] { char b[32]; time_t t = time(nullptr); strftime(b, sizeof b, "%FT%TZ", gmtime(&t)); return std::string(b); };
+    std::string w0 = utc();
+    auto s0 = std::chrono::steady_clock::now();
+    long n = 0;
+    CK(gpuEventRecord(e0));
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count() < gpu_seconds) {
+      for (int k = 0; k < 16; ++k, ++n) {
+        EncodeKernel<<<(n_reads + 127) / 128, 128>>>(o, d_calls, d_rc, n_reads, d_reads, d_op, d_len, d_seq, d_qual,
+                                                     d_ref, d_scratch, d_ok);
+        AssembleKernel<<<cap.calls.size(), 64>>>(o, d_calls, d_reads, d_ok, d_ref, d_scratch, d_keep, d_heaps, d_out);
+      }
+      CK(gpuDeviceSynchronize());
+    }
+    CK(gpuEventRecord(e1)); CK(gpuEventSynchronize(e1)); CK(gpuGetLastError());
+    float ms; CK(gpuEventElapsedTime(&ms, e0, e1));
+    printf("GPU sustained: %ld passes in %.1f s (%s to %s) = %.2f us/call mean\n", n, ms / 1e3, w0.c_str(),
+           utc().c_str(), 1e3 * ms / (double(n) * cap.calls.size()));
   }
   std::vector<uint8_t> dev(cap.calls.size() * img);
   auto d0 = std::chrono::steady_clock::now();
