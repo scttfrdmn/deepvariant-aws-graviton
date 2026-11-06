@@ -1371,6 +1371,52 @@ class OutputsWriter:
 
 
 # Allele-counting loops in C++ (deepvariant-aws-graviton#10); DV_COUNT_PY=1 off.
+_READ_BATCH = os.environ.get('DV_READ_BATCH', '1') != '0'
+
+
+class _BatchReader(object):
+  """InMemorySamReader over a C++ ReadBatch (deepvariant-aws-graviton#10).
+
+  `reads` and iterate() hand the batch itself to the C++ consumers; query()
+  materializes protos only if a Python consumer actually iterates it.
+  """
+
+  def __init__(self, batch):
+    self.batch = batch
+    self.reads = batch
+    self.is_sorted = False
+
+  def replace_reads(self, reads, is_sorted=False):
+    b = allelecounter.ReadBatch()
+    for r in reads:
+      b.append(r)
+    self.__init__(b)
+    self.is_sorted = is_sorted
+
+  def iterate(self):
+    return self.batch
+
+  def query(self, region):
+    # A generator function, not a generator expression: the expression would
+    # evaluate to_protos() at creation, copying every read to Python.
+    for read in self.batch.to_protos():
+      if utils.read_overlaps_region(read, region):
+        yield read
+
+
+def _native_sam_reader(reader):
+  """The nucleus C++ SamReader behind a sam.SamReader, or None."""
+  native = getattr(reader, '_reader', None)
+  if not isinstance(native, sam.NativeSamReader):
+    return None
+  inner = getattr(native, '_reader', None)
+  if inner is None or not hasattr(inner, 'query') or not hasattr(inner, 'header'):
+    return None
+  if type(inner).__name__ != 'SamReader':
+    return None
+  return inner
+
+
 _CPP_COUNT_LOOPS = not os.environ.get('DV_COUNT_PY')
 _DERIVE_TRACKED = os.environ.get('DV_DERIVE', '1') != '0'
 
@@ -2140,6 +2186,73 @@ class RegionProcessor:
     self.region_number += 1
     before_get_reads = time.time()
     runtimes['num reads'] = 0
+    if self._read_batch_ok():
+      self._fetch_and_realign_batch(region, runtimes)
+    else:
+      self._fetch_and_realign_protos(region, runtimes)
+
+    runtimes['get reads'] = trim_runtime(time.time() - before_get_reads)
+    before_find_candidates = time.time()
+    return self._process_after_reads(region, region_n, runtimes,
+                                     before_find_candidates)
+
+  def _read_batch_ok(self):
+    """Whether this run keeps region reads in a C++ ReadBatch (#10)."""
+    if not _READ_BATCH or len(self.samples) != 1:
+      return False
+    o = self.options
+    if (
+        o.joint_realignment
+        or o.phase_reads
+        or o.max_reads_for_dynamic_bases_per_region > 0
+        or in_training_mode(o)
+        or o.allele_counter_options.normalize_reads
+        or not _CPP_COUNT_LOOPS
+    ):
+      return False
+    sample = self.samples[0]
+    if sample.in_memory_sam_reader is None or not sample.sam_readers:
+      return False
+    if any(_native_sam_reader(r) is None for r in sample.sam_readers):
+      return False
+    if o.realigner_enabled and self.can_realign(sample):
+      if not realigner_module._use_cpp_region_realigner(self.realigner):
+        return False
+    return True
+
+  def _fetch_and_realign_batch(self, region, runtimes):
+    """process()' read fetch, sampling and realignment on a ReadBatch.
+
+    Same reads, same order, as region_reads_norealign + realign_reads +
+    replace_reads on protos.
+    """
+    sample = self.samples[0]
+    batch = allelecounter.ReadBatch()
+    for r in sample.sam_readers:
+      batch.append_query(_native_sam_reader(r), region)
+    k = self.options.max_reads_per_partition
+    if k > 0 and len(batch) > k:
+      idx = utils.reservoir_sample(
+          range(len(batch)), k, np.random.RandomState(self.options.random_seed)
+      )
+      batch.select(idx)
+    runtimes['num reads'] += len(batch)
+    if len(batch) and self.options.realigner_enabled and self.can_realign(
+        sample
+    ):
+      if not self.realigner.realign_batch(
+          batch, region, self.options.max_read_length_to_realign
+      ):
+        reads = self.realign_reads(batch.to_protos(), region)
+        batch = allelecounter.ReadBatch()
+        for r in reads:
+          batch.append(r)
+    # replace_reads only with a non-empty read list, as below.
+    if len(batch):
+      sample.in_memory_sam_reader = _BatchReader(batch)
+
+  def _fetch_and_realign_protos(self, region, runtimes):
+    """process()' read fetch and realignment on Read protos (stock path)."""
     # Collect reads from multiple BAMs. Each BAM contains a sample.
     sample_reads_list_to_realign = []
     sample_reads_list = []
@@ -2186,8 +2299,9 @@ class RegionProcessor:
             sample_reads_list[sample_index]
         )
 
-    runtimes['get reads'] = trim_runtime(time.time() - before_get_reads)
-    before_find_candidates = time.time()
+  def _process_after_reads(self, region, region_n, runtimes,
+                           before_find_candidates):
+    """process() from candidate finding on (split out for the ReadBatch path)."""
 
     # Region is expanded by region_padding number of bases. This functionality
     # is only needed when phase_reads flag is on.

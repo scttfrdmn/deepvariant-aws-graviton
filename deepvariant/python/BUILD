@@ -270,6 +270,7 @@ pybind_extension(
     name = "make_examples_native",
     srcs = ["make_examples_native_pybind.cc"],
     deps = [
+        "//deepvariant:allelecounter",
         "//deepvariant:make_examples_native",
         "//deepvariant/protos:deepvariant_cc_pb2",
         "//third_party/nucleus/core/python:type_caster_nucleus_status",
@@ -286,6 +287,7 @@ pybind_library(
     name = "make_examples_native_cclib",
     srcs = ["make_examples_native_pybind.cc"],
     deps = [
+        "//deepvariant:allelecounter",
         "//deepvariant:make_examples_native",
         "//deepvariant/protos:deepvariant_cc_pb2",
         "//third_party/nucleus/core/python:type_caster_nucleus_status",

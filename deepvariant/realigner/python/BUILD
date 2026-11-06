@@ -13,6 +13,7 @@ pybind_extension(
     deps = [
         "//deepvariant/realigner:fast_pass_aligner",
         "//deepvariant/realigner:region_realigner",
+        "//deepvariant:allelecounter",
         "//third_party/nucleus/io:reference",
         "//third_party/nucleus/core/python:type_caster_nucleus_status",
         "//third_party/nucleus/core/python:type_caster_nucleus_statusor",
@@ -28,6 +29,7 @@ pybind_library(
     deps = [
         "//deepvariant/realigner:fast_pass_aligner",
         "//deepvariant/realigner:region_realigner",
+        "//deepvariant:allelecounter",
         "//third_party/nucleus/io:reference",
         "//third_party/nucleus/core/python:type_caster_nucleus_status",
         "//third_party/nucleus/core/python:type_caster_nucleus_statusor",

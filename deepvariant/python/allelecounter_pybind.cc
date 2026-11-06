@@ -50,6 +50,8 @@
 #include "deepvariant/allelecounter.h"
 #include "third_party/nucleus/util/utils.h"
 #include "deepvariant/gvcf_blocks.h"
+#include "deepvariant/read_batch.h"
+#include "third_party/nucleus/io/sam_reader.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_status.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_statusor.h"
 #include "third_party/nucleus/protos/cigar.pb.h"
@@ -97,6 +99,29 @@ PYBIND11_MODULE(allelecounter, m) {
       // Python loop `for read in in_memory_sam_reader.query(region): add(...)`
       // in one call (deepvariant-aws-graviton#10). Returns the number added.
       .def("add_overlapping",
+           [](AlleleCounter* self, const ReadBatch& batch,
+              const nucleus::genomics::v1::Range& region,
+              absl::string_view sample) {
+             int n = 0;
+             for (const nucleus::genomics::v1::Read* r : batch.reads()) {
+               if (nucleus::ReadOverlapsRegion(*r, region)) {
+                 self->Add(*r, sample, nullptr);
+                 ++n;
+               }
+             }
+             return n;
+           },
+           py::arg("reads"), py::arg("region"), py::arg("sample"))
+      .def("derive_tracked_from",
+           [](AlleleCounter* self, AlleleCounter* src, const ReadBatch& batch,
+              const nucleus::genomics::v1::Range& region,
+              absl::string_view sample) {
+             return self->DeriveTrackedFrom(src, batch.ConstPtrs(), region,
+                                            sample);
+           },
+           py::arg("src"), py::arg("reads"), py::arg("region"),
+           py::arg("sample"))
+      .def("add_overlapping",
            [](AlleleCounter* self,
               const std::vector<
                   nucleus::ConstProtoPtr<const nucleus::genomics::v1::Read>>&
@@ -117,6 +142,41 @@ PYBIND11_MODULE(allelecounter, m) {
            py::arg("src"), py::arg("reads"), py::arg("region"),
            py::arg("sample"))
       .def("counts", &AlleleCounter::Counts);
+
+  // A region's reads kept in C++ (deepvariant-aws-graviton#10): see
+  // read_batch.h. Python holds the batch; the C++ stages take its pointers.
+  py::classh<ReadBatch>(m, "ReadBatch")
+      .def(py::init<>())
+      .def_static(
+          "query",
+          [](nucleus::SamReader& reader,
+             const nucleus::genomics::v1::Range& region) {
+            auto b = std::make_unique<ReadBatch>();
+            std::string err;
+            if (!b->AppendQuery(reader, region, &err))
+              throw std::runtime_error(err);
+            return b;
+          },
+          py::arg("reader"), py::arg("region"))
+      .def("append_query",
+           [](ReadBatch* self, nucleus::SamReader& reader,
+              const nucleus::genomics::v1::Range& region) {
+             std::string err;
+             if (!self->AppendQuery(reader, region, &err))
+               throw std::runtime_error(err);
+           },
+           py::arg("reader"), py::arg("region"))
+      .def("append", &ReadBatch::Append, py::arg("read"))
+      .def("__len__", &ReadBatch::size)
+      .def("select", &ReadBatch::Select, py::arg("indices"))
+      .def("read", [](const ReadBatch& self, int i) { return self.at(i); },
+           py::arg("i"))
+      .def("to_protos", [](const ReadBatch& self) {
+        std::vector<nucleus::genomics::v1::Read> v;
+        v.reserve(self.size());
+        for (const auto* r : self.reads()) v.push_back(*r);
+        return v;
+      });
 
   // gVCF blocks in C++ (deepvariant-aws-graviton): see gvcf_blocks.h.
   py::class_<GvcfTable>(m, "GvcfTable")

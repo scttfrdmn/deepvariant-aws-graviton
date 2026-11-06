@@ -75,10 +75,12 @@ cc_library(
     srcs = [
         "allelecounter.cc",
         "gvcf_blocks.cc",
+        "read_batch.cc",
     ],
     hdrs = [
         "allelecounter.h",
         "gvcf_blocks.h",
+        "read_batch.h",
     ],
     deps = [
         "//third_party/nucleus/protos:struct_cc_pb2",

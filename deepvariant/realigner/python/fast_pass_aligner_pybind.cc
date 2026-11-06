@@ -42,6 +42,7 @@
 
 #include "deepvariant/realigner/fast_pass_aligner.h"
 #include "deepvariant/realigner/region_realigner.h"
+#include "deepvariant/read_batch.h"
 #include "third_party/nucleus/io/reference.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_status.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_statusor.h"
@@ -117,4 +118,43 @@ PYBIND11_MODULE(fast_pass_aligner, m) {
       },
       py::arg("reads"), py::arg("region"), py::arg("ref"), py::arg("config"),
       py::arg("ws_light"));
+
+  // make_examples' realign_reads on a ReadBatch, in place: reads longer than
+  // max_read_length_to_realign (when > 0) first, in input order, then the
+  // realigned short reads in realign_reads' output order. Returns
+  // last_read_size (or -1), or None when the configuration isn't covered and
+  // Python should run (batch unchanged).
+  m.def(
+      "realign_batch",
+      [](ReadBatch* batch, const nucleus::genomics::v1::Range& region,
+         const nucleus::GenomeReference* ref, const RealignerOptions& config,
+         bool ws_light, int max_read_length) -> py::object {
+        const auto& reads = batch->reads();
+        std::vector<int> long_idx, short_idx;
+        for (int i = 0; i < static_cast<int>(reads.size()); ++i) {
+          if (max_read_length > 0 &&
+              static_cast<int>(reads[i]->aligned_sequence().size()) >
+                  max_read_length)
+            long_idx.push_back(i);
+          else
+            short_idx.push_back(i);
+        }
+        RegionRealignment out;
+        if (!short_idx.empty()) {
+          std::vector<const nucleus::genomics::v1::Read*> ptrs;
+          ptrs.reserve(short_idx.size());
+          for (int i : short_idx) ptrs.push_back(reads[i]);
+          if (!RealignRegion(ptrs, region, *ref, config, ws_light, &out))
+            return py::none();
+        }
+        std::vector<int> order(long_idx);
+        for (int j : out.order) order.push_back(short_idx[j]);
+        std::vector<int> replaced_pos;
+        for (int p : out.replaced_pos)
+          replaced_pos.push_back(p + static_cast<int>(long_idx.size()));
+        batch->Reorder(order, replaced_pos, &out.replaced);
+        return py::int_(out.last_read_size);
+      },
+      py::arg("batch"), py::arg("region"), py::arg("ref"), py::arg("config"),
+      py::arg("ws_light"), py::arg("max_read_length"));
 }

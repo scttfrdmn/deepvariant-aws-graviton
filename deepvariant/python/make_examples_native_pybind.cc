@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "deepvariant/make_examples_native.h"
+#include "deepvariant/read_batch.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_status.h"
 #include "third_party/nucleus/core/python/type_caster_nucleus_statusor.h"
 #include "third_party/nucleus/util/python/type_caster_nucleus_proto_ptr.h"
@@ -65,6 +66,29 @@ PYBIND11_MODULE(make_examples_native, m) {
           py::arg("test_mode") = false)
       // TODO Do I need to actually implement or call the constructor??
 
+      // Reads per sample as ReadBatches (deepvariant-aws-graviton#10).
+      .def("write_examples_in_region",
+           [](ExamplesGenerator* self,
+              const std::vector<nucleus::ConstProtoPtr<DeepVariantCall>>&
+                  candidates,
+              const std::vector<const ReadBatch*>& batches,
+              const std::vector<int>& sample_order, const std::string& role,
+              const std::vector<float>& mean_coverage_per_sample) {
+             std::vector<std::vector<
+                 nucleus::ConstProtoPtr<::nucleus::genomics::v1::Read>>>
+                 reads_per_sample;
+             reads_per_sample.reserve(batches.size());
+             for (const ReadBatch* b : batches)
+               reads_per_sample.push_back(b->MutablePtrs());
+             std::vector<int> image_shape;
+             std::unordered_map<std::string, int> cpp_result =
+                 self->WriteExamplesInRegion(
+                     candidates, reads_per_sample, sample_order, role,
+                     mean_coverage_per_sample, &image_shape);
+             py::object ret0 = py::cast(std::move(cpp_result));
+             py::object ret1 = py::cast(std::move(image_shape));
+             return py::make_tuple(ret0, ret1);
+           })
       .def("write_examples_in_region",
            [](ExamplesGenerator* self,
               const std::vector<nucleus::ConstProtoPtr<DeepVariantCall>>&

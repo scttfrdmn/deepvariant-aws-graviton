@@ -807,6 +807,32 @@ class Realigner(object):
       out[i] = r
     return out
 
+  def realign_batch(self, batch, region, max_read_length):
+    """make_examples' realign_reads on a ReadBatch in place (#10).
+
+    Same result as make_examples' realign_reads (long reads first, then the
+    realigned short reads) on batch.to_protos(). Returns False, batch
+    unchanged, when the C++ path doesn't cover the configuration.
+    """
+    if not _use_cpp_region_realigner(self):
+      return False
+    ws = self.config.ws_config
+    light = (
+        ws.window_selector_model.model_type
+        == realigner_pb2.WindowSelectorModel.VARIANT_READS
+        and os.environ.get('DV_WS_LIGHT', '1') != '0'
+    )
+    res = fast_pass_aligner.realign_batch(
+        batch, region, self.ref_reader.c_reader, self.config, light,
+        max_read_length,
+    )
+    if res is None:
+      return False
+    if res >= 0:
+      self.config.aln_config.read_size = res
+      self.config.aln_config.force_alignment = False
+    return True
+
   def realign_reads(self, reads, region):
     """Run realigner.
 
