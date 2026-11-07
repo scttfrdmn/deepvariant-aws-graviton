@@ -40,6 +40,24 @@ sub("""  def _parse_example(example):
   def _parse_example(example):
     \"\"\"Parses a serialized tf.Example.\"\"\"
 """)
+# The file dataset's tail: with DV_CV_ENGINE=cvdnn, tf.data autotuning is off. Its
+# model thread waits up to 60 s between optimizations, and with inference outside
+# TF the end of iteration then stalled 18-60 s in 2 of 6 chr20 runs (0 of 6 with
+# autotune off). Parallelism AUTOTUNE then means the process's CPU count.
+old_tail = """    enc_image_variant_alt_allele_ds = enc_image_variant_alt_allele_ds.batch(
+        batch_size=batch_size
+    ).prefetch(tf.data.AUTOTUNE)
+    return enc_image_variant_alt_allele_ds
+"""
+assert s.count(old_tail) == 2, 'dataset tail anchor'
+i = s.rindex(old_tail)
+s = s[:i] + old_tail.replace("""    return enc_image_variant_alt_allele_ds
+""", """    if cvdnn_u8:
+      options = tf.data.Options()
+      options.autotune.enabled = False
+      enc_image_variant_alt_allele_ds = enc_image_variant_alt_allele_ds.with_options(options)
+    return enc_image_variant_alt_allele_ds
+""") + s[i + len(old_tail):]
 sub("""  logging.info('example_shape: %s', example_shape)
 """, """  logging.info('example_shape: %s', example_shape)
   cvdnn_engine = None

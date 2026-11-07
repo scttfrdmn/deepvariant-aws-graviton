@@ -534,6 +534,10 @@ def get_dataset(
     enc_image_variant_alt_allele_ds = enc_image_variant_alt_allele_ds.batch(
         batch_size=batch_size
     ).prefetch(tf.data.AUTOTUNE)
+    if cvdnn_u8:
+      options = tf.data.Options()
+      options.autotune.enabled = False
+      enc_image_variant_alt_allele_ds = enc_image_variant_alt_allele_ds.with_options(options)
     return enc_image_variant_alt_allele_ds
 
 
