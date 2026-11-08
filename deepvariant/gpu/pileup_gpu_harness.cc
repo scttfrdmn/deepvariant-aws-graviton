@@ -236,6 +236,7 @@ static size_t Diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
   return bad;
 }
 
+#ifndef DV_HARNESS_NO_MAIN  // fused_cv.cc includes this file for Load/Assemble/Up
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s DUMP.bin [--tfrecord_images FILE] [--reps N]\n", argv[0]); return 1; }
   const char* tfimg = nullptr; int reps = 5; double gpu_seconds = 0;
@@ -349,3 +350,4 @@ int main(int argc, char** argv) {
   printf("GATE %s\n", bad ? "FAIL" : "IDENTICAL");
   return bad ? 3 : 0;
 }
+#endif  // DV_HARNESS_NO_MAIN
