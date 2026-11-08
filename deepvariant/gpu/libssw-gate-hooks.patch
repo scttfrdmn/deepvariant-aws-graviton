@@ -1,0 +1,80 @@
+--- a/src/ssw.c
++++ b/src/ssw.c
+@@ -973,12 +973,24 @@
+ 	return bests;
+ }
+ 
++
++/* aws-realign#130 (b): SSW_DUMP=FILE records every ssw_align_scan call (inputs
++ * and outputs) for the GPU Smith-Waterman gate; SSW_GPU_IN=FILE replays the
++ * forward/reverse-pass results (score1, ends, begins) computed elsewhere, so
++ * only banded_sw runs here. Single-threaded replay harness use only. */
++static FILE* ssw_env_file(const char* var, const char* mode, FILE** f, int* init) {
++	if (!*init) { const char* p = getenv(var); *init = 1; if (p) *f = fopen(p, mode); }
++	return *f;
++}
++static FILE* ssw_dump_file(void) { static FILE* f = 0; static int i = 0; return ssw_env_file("SSW_DUMP", "wb", &f, &i); }
++static FILE* ssw_gin_file(void) { static FILE* f = 0; static int i = 0; return ssw_env_file("SSW_GPU_IN", "rb", &f, &i); }
+ /* ssw_align with every pass on sw_scan16. */
+ static s_align* ssw_align_scan (const s_profile* prof, const int8_t* ref, int32_t refLen,
+ 		const uint8_t weight_gapO, const uint8_t weight_gapE, const uint8_t flag,
+ 		const uint16_t filters, const int32_t filterd, const int32_t maskLen) {
+ 	alignment_end* bests, *bests_reverse;
+-	int32_t band_width = 0, readLen = prof->readLen;
++	int32_t band_width = 0, readLen = prof->readLen, refLen0 = refLen;
++	uint16_t rev_score = 0;
+ 	int8_t* read_reverse = 0;
+ 	cigar* path;
+ 	s_align* r = (s_align*)calloc(1, sizeof(s_align));
+@@ -990,6 +1002,15 @@
+ 	if (maskLen < 15) {
+ 		fprintf(stderr, "When maskLen < 15, the function ssw_align doesn't return 2nd best alignment information.\n");
+ 	}
++	FILE* gin = ssw_gin_file();
++	struct { uint32_t magic; int32_t readLen, refLen; uint16_t score1, rev_score; int32_t ref_end1, read_end1, ref_begin1, read_begin1; } g;
++	if (gin) {
++		if (fread(&g, sizeof g, 1, gin) != 1 || g.magic != 0x47575353 || g.readLen != readLen || g.refLen != refLen) {
++			fprintf(stderr, "SSW_GPU_IN: record mismatch\n"); abort();
++		}
++		bests = (alignment_end*) calloc(2, sizeof(alignment_end));
++		bests[0].score = g.score1; bests[0].ref = g.ref_end1; bests[0].read = g.read_end1;
++	} else
+ 	bests = sw_scan16(ref, 0, refLen, prof->read, readLen, prof->mat, prof->n, weight_gapO, weight_gapE, (uint16_t)-1, maskLen);
+ 	r->score1 = bests[0].score;
+ 	r->ref_end1 = bests[0].ref;
+@@ -1003,9 +1024,15 @@
+ 	}
+ 	free(bests);
+ 	if (flag == 0 || (flag == 2 && r->score1 < filters)) goto end;
++	if (gin) {
++		bests_reverse = (alignment_end*) calloc(2, sizeof(alignment_end));
++		bests_reverse[0].score = g.rev_score; bests_reverse[0].ref = g.ref_begin1; bests_reverse[0].read = r->read_end1 - g.read_begin1;
++	} else {
+ 	read_reverse = seq_reverse(prof->read, r->read_end1);
+ 	bests_reverse = sw_scan16(ref, 1, r->ref_end1 + 1, read_reverse, r->read_end1 + 1, prof->mat, prof->n, weight_gapO, weight_gapE, r->score1, maskLen);
+ 	free(read_reverse);
++	}
++	rev_score = bests_reverse[0].score;
+ 	r->ref_begin1 = bests_reverse[0].ref;
+ 	r->read_begin1 = r->read_end1 - bests_reverse[0].read;
+ 	if (UNLIKELY(r->score1 > bests_reverse[0].score)) {
+@@ -1025,6 +1052,19 @@
+ 		free(path);
+ 	}
+ end:
++	{
++		FILE* df = ssw_dump_file();
++		if (df) {
++			uint32_t magic = 0x52575353;  /* "SSWR" */
++			int32_t hdr[5] = { refLen0, prof->readLen, prof->n, filterd, maskLen };
++			uint8_t pen[4] = { weight_gapO, weight_gapE, flag, 0 };
++			fwrite(&magic, 4, 1, df); fwrite(hdr, 4, 5, df); fwrite(pen, 1, 4, df); fwrite(&filters, 2, 1, df);
++			fwrite(ref, 1, refLen0, df); fwrite(prof->read, 1, prof->readLen, df); fwrite(prof->mat, 1, prof->n * prof->n, df);
++			int32_t o[6] = { r->score1, r->ref_begin1, r->ref_end1, r->read_begin1, r->read_end1, r->flag };
++			fwrite(o, 4, 6, df); fwrite(&rev_score, 2, 1, df);
++			fwrite(&r->cigarLen, 4, 1, df); if (r->cigarLen) fwrite(r->cigar, 4, r->cigarLen, df);
++		}
++	}
+ 	return r;
+ }
+ #endif
