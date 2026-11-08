@@ -34,8 +34,10 @@
 
 #include <memory>
 #include <string>
+#include <cstring>
 #include <vector>
 
+#include "deepvariant/pileup_channel_lib.h"
 #include "deepvariant/protos/deepvariant.pb.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
@@ -143,7 +145,8 @@ class PileupImageEncoderNative {
       const learning::genomics::deepvariant::DeepVariantCall& dv_call,
       absl::string_view ref_bases, const nucleus::genomics::v1::Read& read,
       int image_start_pos, const std::vector<std::string>& alt_alleles,
-      absl::flat_hash_set<DeepVariantChannelEnum> channels_enum_to_blank = {});
+      const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank =
+          {});
 
   // Simple wrapper around EncodeRead that allows us to efficiently pass large
   // protobufs in from Python. Simply unwraps the ConstProtoPtr objects and
@@ -167,7 +170,36 @@ class PileupImageEncoderNative {
   int GetHapIndex(const nucleus::genomics::v1::Read& read);
 
   const PileupImageOptions options_;
+  // Exact table-driven read encoder, when the channel set allows it (#10).
+  std::shared_ptr<const FastReadEncoder> fast_encoder_;
 };
+
+// Exact fast pileup path (deepvariant-aws-graviton#10): per-read channels
+// without per-base overhead, the reference band encoded once per pileup, and
+// rows interleaved into the image array a row at a time. Same bytes as the
+// original code; DV_PILEUP_FAST=0 selects the original code.
+bool PileupFastPath();
+
+namespace internal {
+// In-place transpose of an 8x8 byte matrix held as eight little-endian words
+// (row r = x[r], column c = byte c): afterwards byte c of x[r] is the old
+// byte r of x[c].
+inline void SwapBits(uint64_t& a, uint64_t& b, int shift, uint64_t mask) {
+  const uint64_t t = ((a >> shift) ^ b) & mask;
+  a ^= t << shift;
+  b ^= t;
+}
+inline void Transpose8x8Bytes(uint64_t x[8]) {
+  constexpr uint64_t k32 = 0x00000000FFFFFFFFull, k16 = 0x0000FFFF0000FFFFull,
+                     k8 = 0x00FF00FF00FF00FFull;
+  SwapBits(x[0], x[4], 32, k32); SwapBits(x[1], x[5], 32, k32);
+  SwapBits(x[2], x[6], 32, k32); SwapBits(x[3], x[7], 32, k32);
+  SwapBits(x[0], x[2], 16, k16); SwapBits(x[1], x[3], 16, k16);
+  SwapBits(x[4], x[6], 16, k16); SwapBits(x[5], x[7], 16, k16);
+  SwapBits(x[0], x[1], 8, k8); SwapBits(x[2], x[3], 8, k8);
+  SwapBits(x[4], x[5], 8, k8); SwapBits(x[6], x[7], 8, k8);
+}
+}  // namespace internal
 
 // Converting a vector<ImageRow> into a 3-d vector where channels are stored in
 // the lowest dimension. Special processing is required for alt aligned
@@ -200,6 +232,74 @@ void FillPileupArray(
     default:
       alt_channel_index = 0;
   }
+  const bool alt_channels =
+      alt_aligned_representation == AltAlignedPileup::kBaseChannels ||
+      alt_aligned_representation == AltAlignedPileup::kDiffChannels;
+  if (!alt_channels && PileupFastPath()) {
+    // Same element order as the loop below: row, then column, then channel.
+    for (int row = 0; row < image.size(); row++) {
+      const auto& channel_data = image[row]->channel_data;
+      if (channel_data.empty()) continue;
+      const int width = image[row]->Width();
+      const int num_channels = channel_data.size();
+      CHECK_LE(buffer_pos + width * num_channels, buffer_size);
+      constexpr int kMaxFastChannels = 32;
+      CHECK_LE(num_channels, kMaxFastChannels);
+      const unsigned char* src[kMaxFastChannels];
+      for (int channel = 0; channel < num_channels; channel++) {
+        CHECK_GE(channel_data[channel].size(), width);
+        src[channel] = channel_data[channel].data();
+      }
+      int column = 0;
+      if (num_channels == 7) {
+        // The standard short-read image: as below, unrolled, with the words
+        // in registers; each column's 7 bytes are stored as an 8-byte write
+        // whose spare byte the next column's write overwrites, and the
+        // block's last column as an exact 7-byte write.
+        unsigned char* const out = &(*pileup_array)[0];
+        for (; column + 8 <= width; column += 8) {
+          uint64_t x[8];
+          for (int channel = 0; channel < 7; channel++) {
+            std::memcpy(&x[channel], src[channel] + column, 8);
+          }
+          x[7] = 0;
+          internal::Transpose8x8Bytes(x);
+          unsigned char* o = out + buffer_pos;
+          std::memcpy(o + 0, &x[0], 8);
+          std::memcpy(o + 7, &x[1], 8);
+          std::memcpy(o + 14, &x[2], 8);
+          std::memcpy(o + 21, &x[3], 8);
+          std::memcpy(o + 28, &x[4], 8);
+          std::memcpy(o + 35, &x[5], 8);
+          std::memcpy(o + 42, &x[6], 8);
+          std::memcpy(o + 49, &x[7], 7);
+          buffer_pos += 56;
+        }
+      } else if (num_channels <= 8) {
+        // Eight columns at a time: load 8 bytes of each channel, transpose the
+        // 8x8 byte block so each word holds one column's channels, and store
+        // num_channels bytes per column (little-endian byte order).
+        unsigned char* const out = &(*pileup_array)[0];
+        for (; column + 8 <= width; column += 8) {
+          uint64_t x[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+          for (int channel = 0; channel < num_channels; channel++) {
+            std::memcpy(&x[channel], src[channel] + column, 8);
+          }
+          internal::Transpose8x8Bytes(x);
+          for (int k = 0; k < 8; k++) {
+            std::memcpy(out + buffer_pos, &x[k], num_channels);
+            buffer_pos += num_channels;
+          }
+        }
+      }
+      for (; column < width; column++) {
+        for (int channel = 0; channel < num_channels; channel++) {
+          (*pileup_array)[buffer_pos + channel] = src[channel][column];
+        }
+        buffer_pos += num_channels;
+      }
+    }
+  } else
   for (int row = 0; row < image.size(); row++) {
     for (int column = 0; column < image[row]->Width(); column++) {
       if (!image[row]->channel_data.empty()) {

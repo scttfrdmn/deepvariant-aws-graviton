@@ -172,6 +172,18 @@ class Channels {
       const std::vector<std::string>& alt_alleles, int image_start_pos,
       absl::flat_hash_set<DeepVariantChannelEnum> channels_enum_to_blank = {});
 
+  // Same result as CalculateChannels, without its per-base overhead
+  // (deepvariant-aws-graviton#10): the CIGAR walk calls the per-base action
+  // directly instead of through std::function, the blank set is consulted
+  // once per read instead of per base and channel, and nothing is copied.
+  bool CalculateChannelsFast(
+      std::vector<std::vector<unsigned char>>& data,
+      absl::Span<const DeepVariantChannelEnum> channel_enums,
+      const nucleus::genomics::v1::Read& read, absl::string_view ref_bases,
+      const DeepVariantCall& dv_call,
+      const std::vector<std::string>& alt_alleles, int image_start_pos,
+      const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank);
+
   // Calculate values for channels that only depend on information at the
   // granularity of an entire read.
   bool CalculateReadLevelData(
@@ -197,6 +209,40 @@ class Channels {
 
   int GetChannelIndex(DeepVariantChannelEnum channel_enum);
 };
+// Exact table-driven read encoder for the standard short-read channel set
+// (read base, base quality, mapping quality, strand, read supports variant,
+// base differs from ref, insert size) (deepvariant-aws-graviton#10). Every
+// value comes from the channel classes themselves: per-base colors are
+// tabulated once per encoder by calling each channel's FillReadBase, and the
+// per-read colors (mapping quality, strand, insert size, read support) are
+// read once per read the same way. The CIGAR walk, the call-site base-quality
+// bail-out and the order of writes are those of Channels::CalculateChannels.
+class FastReadEncoder {
+ public:
+  FastReadEncoder(const PileupImageOptions& options,
+                  absl::Span<const DeepVariantChannelEnum> channel_enums);
+  // False when the channel set has a channel this encoder does not cover.
+  bool supported() const { return supported_; }
+  // As Channels::CalculateChannels; returns false where it would.
+  bool Encode(std::vector<std::vector<unsigned char>>& data,
+              const nucleus::genomics::v1::Read& read,
+              absl::string_view ref_bases, const DeepVariantCall& dv_call,
+              const std::vector<std::string>& alt_alleles, int image_start_pos,
+              const absl::flat_hash_set<DeepVariantChannelEnum>&
+                  channels_enum_to_blank) const;
+
+ private:
+  enum Kind : uint8_t { kBase, kQual, kDiff, kMq, kStrand, kSupport, kInsert };
+  const PileupImageOptions options_;  // own copy: channel objects refer to it
+  std::vector<DeepVariantChannelEnum> channel_enums_;
+  std::vector<int> index_;    // channel_enums_[i] -> data index (as CalculateChannels)
+  std::vector<Kind> kind_;    // per channel_enums_ entry
+  bool supported_ = false;
+  unsigned char base_color_[256] = {};
+  unsigned char qual_color_[256] = {};
+  unsigned char diff_color_[2] = {};
+};
+
 }  // namespace deepvariant
 }  // namespace genomics
 }  // namespace learning

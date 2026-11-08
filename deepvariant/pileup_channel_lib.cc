@@ -162,6 +162,260 @@ bool Channels::CalculateChannels(
   return CalculateBaseLevelData(read, action_per_cigar_unit);
 }
 
+namespace {
+// CalculateBaseLevelData's CIGAR walk with the action as a template parameter
+// (inlined, no std::function); same events in the same order, same
+// short-circuit and early-return behaviour.
+template <typename Action>
+bool WalkCigar(const Read& read, Action&& action_per_cigar_unit) {
+  int ref_i = read.alignment().position().position();
+  int read_i = 0;
+  bool ok = true;
+  for (const auto& cigar_elt : read.alignment().cigar()) {
+    const CigarUnit::Operation op = cigar_elt.operation();
+    int op_len = cigar_elt.operation_length();
+    switch (op) {
+      case CigarUnit::ALIGNMENT_MATCH:
+      case CigarUnit::SEQUENCE_MATCH:
+      case CigarUnit::SEQUENCE_MISMATCH:
+        for (int i = 0; i < op_len; i++) {
+          ok = ok && action_per_cigar_unit(ref_i, read_i, op);
+          ref_i++;
+          read_i++;
+        }
+        break;
+      case CigarUnit::INSERT:
+      case CigarUnit::CLIP_SOFT:
+        if (ref_i > 0) {
+          ok = action_per_cigar_unit(ref_i - 1, read_i, op);
+        }
+        read_i += op_len;
+        break;
+      case CigarUnit::DELETE:
+      case CigarUnit::SKIP:
+        if (read_i > 0) {
+          ok = action_per_cigar_unit(ref_i, read_i - 1, op);
+        }
+        ref_i += op_len;
+        break;
+      case CigarUnit::CLIP_HARD:
+      case CigarUnit::PAD:
+        break;
+      default:
+        LOG(FATAL) << "Unrecognized CIGAR op";
+    }
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
+bool Channels::CalculateChannelsFast(
+    std::vector<std::vector<unsigned char>>& data,
+    absl::Span<const DeepVariantChannelEnum> channel_enums, const Read& read,
+    absl::string_view ref_bases, const DeepVariantCall& dv_call,
+    const std::vector<std::string>& alt_alleles, int image_start_pos,
+    const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank) {
+  CHECK_EQ(data.size(), channel_enums.size())
+      << "Size of provided data vector does not match the number of channels "
+         "specified";
+
+  int maxEnumValue = getMaxEnumValue(channel_enums);
+  channel_enum_to_index_ = std::vector<int>(maxEnumValue + 1);
+  int currIndex = 0;
+  for (const DeepVariantChannelEnum channel_enum : channel_enums) {
+    channel_enum_to_index_[channel_enum] = currIndex;
+    currIndex++;
+  }
+
+  std::vector<std::unique_ptr<Channel>> channel_objects =
+      std::vector<std::unique_ptr<Channel>>(maxEnumValue + 1);
+  for (const DeepVariantChannelEnum channel_enum : channel_enums) {
+    channel_objects[channel_enum] =
+        Channels::ChannelEnumToObject(channel_enum, ref_bases.size(), options_);
+  }
+
+  // The channels CalculateChannels' per-base loop would fill, in its order
+  // (channel_enums order, blanked ones skipped, index and object looked up
+  // exactly as there), resolved once per read.
+  constexpr int kMaxActive = 32;
+  std::vector<unsigned char>* active_data[kMaxActive];
+  Channel* active_obj[kMaxActive];
+  int n_active = 0;
+  for (const DeepVariantChannelEnum channel_enum : channel_enums) {
+    if (channels_enum_to_blank.contains(channel_enum)) continue;
+    CHECK_LT(n_active, kMaxActive);
+    active_data[n_active] = &data[channel_enum_to_index_[channel_enum]];
+    active_obj[n_active] = channel_objects[channel_enum].get();
+    n_active++;
+  }
+
+  const char anchor_char = options_.indel_anchoring_base_char()[0];
+  const int64_t call_start = dv_call.variant().start();
+  const int min_base_quality = options_.read_requirements().min_base_quality();
+  const std::string& seq = read.aligned_sequence();
+  const auto& qual = read.aligned_quality();
+  const size_t width = ref_bases.size();
+
+  auto action = [&](int ref_i, int read_i, CigarUnit::Operation cigar_op) {
+    char read_base = 0;
+    if (cigar_op == CigarUnit::INSERT) {
+      read_base = anchor_char;
+    } else if (cigar_op == CigarUnit::DELETE) {
+      ref_i -= 1;  // Adjust anchor base on reference
+      read_base = anchor_char;
+    } else if (cigar_op == CigarUnit::ALIGNMENT_MATCH ||
+               cigar_op == CigarUnit::SEQUENCE_MATCH ||
+               cigar_op == CigarUnit::SEQUENCE_MISMATCH) {
+      read_base = seq[read_i];
+    }
+    size_t col = ref_i - image_start_pos;
+    if (read_base && col < width) {
+      uint8_t base_quality = qual[read_i];
+      if (ref_i == call_start && base_quality < min_base_quality) {
+        return false;
+      }
+      char ref_base = ref_bases[col];
+      for (int k = 0; k < n_active; k++) {
+        active_obj[k]->FillReadBase(*active_data[k], col, read_base, ref_base,
+                                    base_quality, read, read_i, dv_call,
+                                    alt_alleles);
+      }
+    }
+    return true;
+  };
+  return WalkCigar(read, action);
+}
+
+FastReadEncoder::FastReadEncoder(
+    const PileupImageOptions& options,
+    absl::Span<const DeepVariantChannelEnum> channel_enums)
+    : options_(options),
+      channel_enums_(channel_enums.begin(), channel_enums.end()) {
+  int max_enum = -1;
+  for (auto e : channel_enums_) max_enum = std::max<int>(max_enum, e);
+  std::vector<int> enum_to_index(max_enum + 1);
+  for (int i = 0; i < channel_enums_.size(); i++) enum_to_index[channel_enums_[i]] = i;
+  supported_ = !channel_enums_.empty() && channel_enums_.size() <= 32;
+  for (auto e : channel_enums_) {
+    index_.push_back(enum_to_index[e]);
+    switch (e) {
+      case DeepVariantChannelEnum::CH_READ_BASE: kind_.push_back(kBase); break;
+      case DeepVariantChannelEnum::CH_BASE_QUALITY: kind_.push_back(kQual); break;
+      case DeepVariantChannelEnum::CH_BASE_DIFFERS_FROM_REF: kind_.push_back(kDiff); break;
+      case DeepVariantChannelEnum::CH_MAPPING_QUALITY: kind_.push_back(kMq); break;
+      case DeepVariantChannelEnum::CH_STRAND: kind_.push_back(kStrand); break;
+      case DeepVariantChannelEnum::CH_READ_SUPPORTS_VARIANT: kind_.push_back(kSupport); break;
+      case DeepVariantChannelEnum::CH_INSERT_SIZE: kind_.push_back(kInsert); break;
+      default: supported_ = false; kind_.push_back(kBase);
+    }
+  }
+  if (!supported_) return;
+  // Per-base colors, tabulated from the channels' own FillReadBase (they
+  // depend only on the read base, the base quality, or base == ref).
+  Channels factory{options_};
+  const Read no_read;
+  const DeepVariantCall no_call;
+  const std::vector<std::string> no_alts;
+  std::vector<unsigned char> px(1, 0);
+  auto base_ch = factory.ChannelEnumToObject(DeepVariantChannelEnum::CH_READ_BASE, 1, options_);
+  auto qual_ch = factory.ChannelEnumToObject(DeepVariantChannelEnum::CH_BASE_QUALITY, 1, options_);
+  auto diff_ch = factory.ChannelEnumToObject(DeepVariantChannelEnum::CH_BASE_DIFFERS_FROM_REF, 1, options_);
+  for (int c = 0; c < 256; c++) {
+    base_ch->FillReadBase(px, 0, static_cast<char>(c), 0, 0, no_read, 0, no_call, no_alts);
+    base_color_[c] = px[0];
+    qual_ch->FillReadBase(px, 0, 'A', 'A', c, no_read, 0, no_call, no_alts);
+    qual_color_[c] = px[0];
+  }
+  diff_ch->FillReadBase(px, 0, 'A', 'C', 0, no_read, 0, no_call, no_alts);
+  diff_color_[0] = px[0];
+  diff_ch->FillReadBase(px, 0, 'A', 'A', 0, no_read, 0, no_call, no_alts);
+  diff_color_[1] = px[0];
+}
+
+bool FastReadEncoder::Encode(
+    std::vector<std::vector<unsigned char>>& data, const Read& read,
+    absl::string_view ref_bases, const DeepVariantCall& dv_call,
+    const std::vector<std::string>& alt_alleles, int image_start_pos,
+    const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank)
+    const {
+  CHECK_EQ(data.size(), channel_enums_.size())
+      << "Size of provided data vector does not match the number of channels "
+         "specified";
+  CHECK(supported_);
+  const std::string& seq = read.aligned_sequence();
+  const auto& qual = read.aligned_quality();
+  const int width = ref_bases.size();
+
+  // Per-read colors: computed by the channels themselves, once, as their own
+  // lazily cached per-read values would be. Only for channels that are drawn.
+  constexpr int kMax = 32;
+  unsigned char* out[kMax];
+  Kind kind[kMax];
+  unsigned char value[kMax];
+  int n = 0;
+  Channels factory{options_};
+  std::vector<unsigned char> px(1, 0);
+  for (int i = 0; i < channel_enums_.size(); i++) {
+    const DeepVariantChannelEnum e = channel_enums_[i];
+    if (channels_enum_to_blank.contains(e)) continue;
+    std::vector<unsigned char>& d = data[index_[i]];
+    CHECK_GE(d.size(), width);
+    out[n] = d.data();
+    kind[n] = kind_[i];
+    value[n] = 0;
+    if (kind_[i] >= kMq) {
+      // InsertSizeChannel indexes its per-read vector (one entry per read base)
+      // by read index; every entry is the same value.
+      if (kind_[i] == kInsert && seq.empty()) {
+        Channels slow{options_};
+        return slow.CalculateChannelsFast(data, channel_enums_, read, ref_bases,
+                                          dv_call, alt_alleles, image_start_pos,
+                                          channels_enum_to_blank);
+      }
+      auto ch = factory.ChannelEnumToObject(e, 1, options_);
+      ch->FillReadBase(px, 0, 'A', 'A', 0, read, 0, dv_call, alt_alleles);
+      value[n] = px[0];
+    }
+    n++;
+  }
+
+  const char anchor_char = options_.indel_anchoring_base_char()[0];
+  const int64_t call_start = dv_call.variant().start();
+  const int min_base_quality = options_.read_requirements().min_base_quality();
+  auto action = [&](int ref_i, int read_i, CigarUnit::Operation cigar_op) {
+    char read_base = 0;
+    if (cigar_op == CigarUnit::INSERT) {
+      read_base = anchor_char;
+    } else if (cigar_op == CigarUnit::DELETE) {
+      ref_i -= 1;  // Adjust anchor base on reference
+      read_base = anchor_char;
+    } else if (cigar_op == CigarUnit::ALIGNMENT_MATCH ||
+               cigar_op == CigarUnit::SEQUENCE_MATCH ||
+               cigar_op == CigarUnit::SEQUENCE_MISMATCH) {
+      read_base = seq[read_i];
+    }
+    size_t col = ref_i - image_start_pos;
+    if (read_base && col < static_cast<size_t>(width)) {
+      uint8_t base_quality = qual[read_i];
+      if (ref_i == call_start && base_quality < min_base_quality) {
+        return false;
+      }
+      const unsigned char per_base[3] = {
+          base_color_[static_cast<unsigned char>(read_base)],
+          qual_color_[base_quality],
+          diff_color_[read_base == ref_bases[col]]};
+      for (int k = 0; k < n; k++) {
+        out[k][col] = kind[k] < kMq ? per_base[kind[k]] : value[k];
+      }
+    }
+    return true;
+  };
+  return WalkCigar(read, action);
+}
+
 // Calculate values for channels that depend on information at the
 // granularity of bases within the read and/or reference sequence.
 bool Channels::CalculateBaseLevelData(
