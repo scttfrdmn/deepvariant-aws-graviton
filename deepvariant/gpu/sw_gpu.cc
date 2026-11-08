@@ -196,7 +196,7 @@ __global__ void SwStripKernel(const Rec* recs, const int* order, int nrec, const
   out[order[t]] = o;
 }
 
-static int g_k = 32, g_threads = 256;
+static int g_k = 32, g_threads = 256, g_chunk = 1 << 18;
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s SSW_DUMP.bin [--gpu_in OUT.bin] [--reps N]\n", argv[0]); return 1; }
@@ -206,6 +206,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--naive")) naive = true;
     else if (!strcmp(argv[i], "--k") && i + 1 < argc) g_k = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--threads") && i + 1 < argc) g_threads = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--chunk") && i + 1 < argc) g_chunk = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
   }
   FILE* f = fopen(argv[1], "rb");
@@ -239,7 +240,7 @@ int main(int argc, char** argv) {
   }
   fclose(f);
   const int N = recs.size();
-  printf("records %d, forward-pass cells %.3g, max query %d, load %.2f s\n", N, cells, maxlen,
+  printf("records %d, forward-pass cells %.3g, max query %d, max reference %d, load %.2f s\n", N, cells, maxlen, maxref,
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   // Order by work so a warp's threads loop alike.
   std::vector<int> order(N); std::iota(order.begin(), order.end(), 0);
@@ -255,7 +256,10 @@ int main(int argc, char** argv) {
   int8_t* d_refs = (int8_t*)up(refs.data(), refs.size());
   int8_t* d_reads = (int8_t*)up(reads.data(), reads.size());
   int8_t* d_mats = (int8_t*)up(mats.data(), mats.size());
-  const int threads = g_threads, blocks = (N + threads - 1) / threads;
+  // Chunks of records (scratch is per thread x longest reference).
+  const int threads = g_threads;
+  const int chunk = std::min(N, g_chunk);
+  const int blocks = (chunk + threads - 1) / threads;
   const size_t T = size_t(blocks) * threads;
   int16_t* d_scratch = nullptr; int16_t *d_hb = nullptr, *d_fb = nullptr; int32_t* d_key = nullptr;
   if (naive) CK(gpuMalloc(&d_scratch, 2 * T * size_t(maxlen) * sizeof(int16_t)));
@@ -269,12 +273,15 @@ int main(int argc, char** argv) {
   for (int r = 0; r < reps; ++r) {
     CK(gpuMemset(d_out, 0xFF, N * sizeof(Out)));
     CK(gpuEventRecord(e0));
-    if (naive) SwKernel<<<blocks, threads>>>(d_recs, d_order, N, d_refs, d_reads, d_mats, d_scratch, size_t(maxlen), d_out);
-    else if (g_k == 8) SwStripKernel<8><<<blocks, threads>>>(d_recs, d_order, N, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
-    else if (g_k == 64) SwStripKernel<64><<<blocks, threads>>>(d_recs, d_order, N, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
-    else if (g_k == 48) SwStripKernel<48><<<blocks, threads>>>(d_recs, d_order, N, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
-    else if (g_k == 32) SwStripKernel<32><<<blocks, threads>>>(d_recs, d_order, N, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
-    else SwStripKernel<16><<<blocks, threads>>>(d_recs, d_order, N, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
+    for (int c0 = 0; c0 < N; c0 += chunk) {
+      const int n = std::min(chunk, N - c0);
+      const int* ord = d_order + c0;
+      if (naive) SwKernel<<<blocks, threads>>>(d_recs, ord, n, d_refs, d_reads, d_mats, d_scratch, size_t(maxlen), d_out);
+      else if (g_k == 64) SwStripKernel<64><<<blocks, threads>>>(d_recs, ord, n, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
+      else if (g_k == 16) SwStripKernel<16><<<blocks, threads>>>(d_recs, ord, n, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
+      else if (g_k == 8) SwStripKernel<8><<<blocks, threads>>>(d_recs, ord, n, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
+      else SwStripKernel<32><<<blocks, threads>>>(d_recs, ord, n, d_refs, d_reads, d_mats, d_hb, d_fb, d_key, d_out);
+    }
     CK(gpuEventRecord(e1)); CK(gpuEventSynchronize(e1)); CK(gpuGetLastError());
     float ms; CK(gpuEventElapsedTime(&ms, e0, e1)); best = std::min(best, ms);
   }
@@ -297,7 +304,7 @@ int main(int argc, char** argv) {
            first, recs[first].refLen, recs[first].readLen, o.score1, o.ref_end1, o.read_end1, o.ref_begin1, o.read_begin1,
            o.rev_score, w.score1, w.ref_end1, w.read_end1, w.ref_begin1, w.read_begin1, w.rev_score);
   }
-  if (naive) printf("naive kernel "); else printf("strip-%d kernel, %d threads/block: ", g_k, g_threads);
+  if (naive) printf("naive kernel "); else printf("strip-%d kernel, %d threads/block, chunks of %d: ", g_k, g_threads, chunk);
   printf("GPU kernel %.3f ms best of %d: %.1f GCUPS (forward cells), %.2f us/alignment\n", best, reps,
          cells / (best * 1e-3) / 1e9, 1e3 * best / N);
   if (gin) {
