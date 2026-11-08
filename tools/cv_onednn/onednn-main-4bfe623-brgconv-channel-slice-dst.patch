@@ -1,0 +1,216 @@
+diff --git a/src/cpu/x64/injectors/jit_uni_binary_injector.cpp b/src/cpu/x64/injectors/jit_uni_binary_injector.cpp
+index 7ca44e293..6507dd52c 100644
+--- a/src/cpu/x64/injectors/jit_uni_binary_injector.cpp
++++ b/src/cpu/x64/injectors/jit_uni_binary_injector.cpp
+@@ -1218,7 +1218,12 @@ void jit_uni_binary_injector_t<Vmm>::calculate_oc_nspc_base(
+     // output = rax
+     const auto rax = host_->rax;
+     const auto rdx = host_->rdx;
+-    const auto C = rhs_arg_static_params_.dst_d.dims()[1];
++    const auto &dst_d_ = rhs_arg_static_params_.dst_d;
++    // channel period: the innermost spatial stride (== C for a dense nspc
++    // dst, > C for a channel slice of a wider tensor)
++    const auto C = dst_d_.ndims() >= 3
++            ? nstl::max(dst_d_.dims()[1], strides[dst_d_.ndims() - 1])
++            : dst_d_.dims()[1];
+ 
+     host_->mov(rax, tmp_reg);
+     host_->mov(tmp_reg, C);
+@@ -1232,7 +1237,12 @@ void jit_uni_binary_injector_t<Vmm>::calculate_oc_nspc_partial(
+         const dim_t *strides, const dim_t offset, const Xbyak::Reg64 &tmp_reg,
+         dim_t elem_size_bytes) const {
+     // c = offset % C
+-    const auto C = rhs_arg_static_params_.dst_d.dims()[1];
++    const auto &dst_d_ = rhs_arg_static_params_.dst_d;
++    // channel period: the innermost spatial stride (== C for a dense nspc
++    // dst, > C for a channel slice of a wider tensor)
++    const auto C = dst_d_.ndims() >= 3
++            ? nstl::max(dst_d_.dims()[1], strides[dst_d_.ndims() - 1])
++            : dst_d_.dims()[1];
+     const auto offset_adj = (offset >> math::ilog2q(types::data_type_size(
+                                      rhs_arg_static_params_.dst_d.data_type())))
+             % C;
+diff --git a/src/cpu/x64/jit_brgemm_1x1_conv.cpp b/src/cpu/x64/jit_brgemm_1x1_conv.cpp
+index c5c38aa5b..4555a03d0 100644
+--- a/src/cpu/x64/jit_brgemm_1x1_conv.cpp
++++ b/src/cpu/x64/jit_brgemm_1x1_conv.cpp
+@@ -226,7 +226,7 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init_brgemm_desc() {
+         brgattr.use_ace = jcp_.is_ace;
+ 
+         CHECK(brgemm_desc_set_attr(&brg, brgattr));
+-        auto LDD = jcp_.oc_without_padding;
++        auto LDD = jcp_.dst_ld;
+         const auto &p = attr()->post_ops_;
+         brg.with_sum = p.find(primitive_kind::sum) != -1;
+         brg.with_weights_scale_adjust = jcp_.scale_adjust_factor != 1.0f;
+@@ -269,7 +269,7 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::init(engine_t *engine) {
+     src_w_sz = (dim_t)IW * jcp.ngroups * jcp.ic_without_padding;
+     src_h_sz = IH * src_w_sz;
+     src_d_sz = ID * src_h_sz;
+-    dst_w_sz = (dim_t)OW * jcp.oc_without_padding;
++    dst_w_sz = (dim_t)OW * jcp.dst_ld;
+     dst_h_sz = OH * dst_w_sz;
+     dst_d_sz = OD * dst_h_sz;
+ 
+@@ -473,7 +473,7 @@ void brgemm_1x1_convolution_fwd_t<isa>::exec_ker(
+             * (dst_d.off_l(0) + n * dst_d.blk_off<false, true>(1)
+                     + g * dst_d.blk_off<false, true>(0, 1) * jcp.oc + oc);
+     const auto dst_offset = dst_dt_size
+-            * (od * dst_h_sz + oh * dst_w_sz + ow * jcp.oc_without_padding);
++            * (od * dst_h_sz + oh * dst_w_sz + ow * jcp.dst_ld);
+ 
+     const auto ptr_D = dst + dst_base + dst_offset;
+     char *const ptr_C = (jcp.use_buffer) ? c_buffer : (char *)ptr_D;
+diff --git a/src/cpu/x64/jit_brgemm_conv.cpp b/src/cpu/x64/jit_brgemm_conv.cpp
+index b83e91113..f9bbde25c 100644
+--- a/src/cpu/x64/jit_brgemm_conv.cpp
++++ b/src/cpu/x64/jit_brgemm_conv.cpp
+@@ -321,7 +321,7 @@ status_t brgemm_convolution_fwd_t<isa>::pd_t::add_brg_descriptor(dim_t vM,
+ 
+     CHECK(brgemm_desc_set_attr(&brg, brgattr));
+ 
+-    auto LDD = jcp_.oc_without_padding;
++    auto LDD = jcp_.dst_ld;
+     brg.with_sum = with_sum_;
+     brg.with_weights_scale_adjust = jcp_.scale_adjust_factor != 1.0f;
+     CHECK(brgemm_desc_set_postops(&brg, attr(), &dst_md_, LDD, jcp_.bia_dt));
+@@ -450,7 +450,7 @@ status_t brgemm_convolution_fwd_t<isa>::pd_t::init(const engine_t *engine) {
+     // const variables used for address calculations
+     src_w_sz = static_cast<dim_t>(IW) * jcp_.ngroups * jcp_.ic_without_padding;
+     src_h_sz = IH * src_w_sz;
+-    dst_w_sz = static_cast<dim_t>(OW) * jcp_.oc_without_padding;
++    dst_w_sz = static_cast<dim_t>(OW) * jcp_.dst_ld;
+     dst_h_sz = OH * dst_w_sz;
+     rd = jcp_.ic;
+     if (jcp_.is_relo_wi())
+@@ -920,7 +920,7 @@ status_t brgemm_convolution_fwd_t<isa>::init(engine_t *engine) {
+     // const variables used for address calculations
+     src_w_sz = static_cast<dim_t>(IW) * jcp.ngroups * jcp.ic_without_padding;
+     src_h_sz = IH * src_w_sz;
+-    dst_w_sz = static_cast<dim_t>(OW) * jcp.oc_without_padding;
++    dst_w_sz = static_cast<dim_t>(OW) * jcp.dst_ld;
+     dst_h_sz = OH * dst_w_sz;
+ 
+     comp_ow_sz = static_cast<dim_t>(jcp.oc_block);
+@@ -1722,7 +1722,7 @@ void brgemm_convolution_fwd_t<isa>::perform_outwork(
+             p.ptr_out = dst_base
+                     + dst_dsz
+                             * (btc.od * dst_h_sz + btc.oh * dst_w_sz
+-                                    + ow_pw_s * jcp.oc_without_padding);
++                                    + ow_pw_s * jcp.dst_ld);
+             p.ptr_in = static_cast<void *>(jcp.use_buffer
+                             ? (btc.c_buffer
+                                       + acc_dsz * (ow_pw_s - ow) * jcp.LDC)
+@@ -1734,7 +1734,7 @@ void brgemm_convolution_fwd_t<isa>::perform_outwork(
+                     : dst_base
+                             + dst_dsz
+                                     * (btc.od * dst_h_sz + btc.oh * dst_w_sz
+-                                            + ow_pw_s * jcp.oc_without_padding);
++                                            + ow_pw_s * jcp.dst_ld);
+             p.ptr_out = static_cast<void *>(ptr_Cz);
+         }
+         (*outwork_ker)(&p);
+@@ -2213,7 +2213,7 @@ void brgemm_convolution_fwd_t<isa>::ker_base(brgemm_thread_ctx_t &btc) const {
+         ptr_D = dst_base
+                 + dst_dsz
+                         * (btc.od * dst_h_sz + btc.oh * dst_w_sz
+-                                + ow_b * jcp.oc_without_padding);
++                                + ow_b * jcp.dst_ld);
+         ptr_C = (jcp.use_buffer)
+                 ? btc.c_buffer + acc_dsz * (ow_b - ow) * jcp.LDC
+                 : static_cast<char *>(ptr_D);
+@@ -2342,7 +2342,7 @@ void brgemm_convolution_fwd_t<isa>::ker_trans(brgemm_thread_ctx_t &btc) const {
+     ptr_D = dst_base
+             + dst_dsz
+                     * (btc.od * dst_h_sz + btc.oh * dst_w_sz
+-                            + ow_b * jcp.oc_without_padding);
++                            + ow_b * jcp.dst_ld);
+     ptr_C = (jcp.use_buffer) ? btc.c_buffer + acc_dsz * (ow_b - ow) * jcp.LDC
+                              : static_cast<char *>(ptr_D);
+ 
+@@ -2470,7 +2470,7 @@ void brgemm_convolution_fwd_t<isa>::ker_vpad(brgemm_thread_ctx_t &btc) const {
+     ptr_D = dst_base
+             + dst_dsz
+                     * (btc.od * dst_h_sz + btc.oh * dst_w_sz
+-                            + ow_b * jcp.oc_without_padding);
++                            + ow_b * jcp.dst_ld);
+     ptr_C = (jcp.use_buffer) ? btc.c_buffer + acc_dsz * (ow_b - ow) * jcp.LDC
+                              : static_cast<char *>(ptr_D);
+ 
+diff --git a/src/cpu/x64/jit_brgemm_conv_utils.cpp b/src/cpu/x64/jit_brgemm_conv_utils.cpp
+index 0c5fb3b67..88a7e484d 100644
+--- a/src/cpu/x64/jit_brgemm_conv_utils.cpp
++++ b/src/cpu/x64/jit_brgemm_conv_utils.cpp
+@@ -418,7 +418,10 @@ status_t pick_tags(jit_brgemm_conv_conf_t &jcp, memory_desc_t &src_md,
+ 
+     const bool any_eligible = is_any_eligible(jcp);
+     CHECK(init_tag(jcp.src_tag, src_md, src_d, src_tag, any_eligible));
+-    CHECK(init_tag(jcp.dst_tag, dst_md, dst_d, dst_tag, any_eligible));
++    if (jcp.dst_ld != jcp.oc_without_padding)
++        jcp.dst_tag = dst_tag; // channel slice, nhwc-ordered (checked in init_jcp)
++    else
++        CHECK(init_tag(jcp.dst_tag, dst_md, dst_d, dst_tag, any_eligible));
+     CHECK(init_tag(jcp.wei_tag, weights_md, weights_d, wei_tag, true));
+ 
+     return status::success;
+@@ -589,7 +592,7 @@ status_t brg_blocking_t::estimate_brgemm_ur() {
+     }
+ 
+     LDB = wei_plain ? oc_without_padding : oc_block;
+-    LDC = use_buffer ? oc_block : oc_without_padding;
++    LDC = use_buffer ? oc_block : dst_ld;
+ 
+     // Configure matrix sizes
+     // for amx if ic_block != ic then we use exec_trans so K is ic_block
+@@ -718,7 +721,7 @@ status_t brg_blocking_t::get_brgemm_ur(
+         return status::invalid_arguments;
+     CHECK(estimate_brgemm_ur());
+ 
+-    LDD = oc_without_padding;
++    LDD = dst_ld;
+ 
+     // The code below will verify that for selected `brgemm_ur` all brgemm
+     // descriptors will be initialized successfully. If they do, stick to this
+@@ -1762,6 +1765,16 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
+     jcp.ngroups = with_groups ? weights_d.dims()[0] : 1;
+     jcp.mb = src_d.dims()[0];
+     jcp.oc_without_padding = dst_d.dims()[1];
++    jcp.dst_ld = jcp.oc_without_padding;
++    if (ndims == 4 && dst_d.format_kind() == format_kind::blocked
++            && dst_d.blocking_desc().inner_nblks == 0 && !with_groups) {
++        // channel slice of a wider nhwc tensor: strides {OH*OW*L, 1, OW*L, L}
++        const auto &st = dst_d.blocking_desc().strides;
++        const dim_t L = st[3], OW_ = dst_d.dims()[3], OH_ = dst_d.dims()[2];
++        if (st[1] == 1 && L > jcp.oc_without_padding && st[2] == OW_ * L
++                && st[0] == OH_ * OW_ * L)
++            jcp.dst_ld = L;
++    }
+     jcp.oc = jcp.oc_without_padding / jcp.ngroups;
+     jcp.ic_without_padding = src_d.dims()[1] / jcp.ngroups;
+     jcp.ic = jcp.ic_without_padding;
+@@ -2029,7 +2042,10 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
+         format_tag_t src_tag = pick(jcp.ndims - 3, nwc, nhwc, ndhwc);
+         const bool any_eligible = is_any_eligible(jcp);
+         CHECK(init_tag(jcp.src_tag, src_md, src_d, src_tag, any_eligible));
+-        CHECK(init_tag(jcp.dst_tag, dst_md, dst_d, src_tag, any_eligible));
++        if (jcp.dst_ld != jcp.oc_without_padding)
++            jcp.dst_tag = src_tag; // channel slice, nhwc-ordered (checked in init_jcp)
++        else
++            CHECK(init_tag(jcp.dst_tag, dst_md, dst_d, src_tag, any_eligible));
+     }
+ 
+     CHECK(attr.set_default_formats(&dst_md));
+diff --git a/src/cpu/x64/jit_primitive_conf.hpp b/src/cpu/x64/jit_primitive_conf.hpp
+index 319baefae..947e8eeeb 100644
+--- a/src/cpu/x64/jit_primitive_conf.hpp
++++ b/src/cpu/x64/jit_primitive_conf.hpp
+@@ -860,6 +860,9 @@ struct jit_brgemm_conv_conf_t {
+     int is_ic_scale, is_oc_scale;
+ 
+     dim_t LDA, LDB, LDC, LDD;
++    // dst channel stride: oc_without_padding, or the channel count of a wider
++    // nhwc tensor when dst is a channel slice of it (in-place concat)
++    dim_t dst_ld;
+ 
+     dim_t M, N, K, M_tail, N_tail, K_tail;
+     // Note: M for brgemm kernel. For use_store_mask it is usually greater than
