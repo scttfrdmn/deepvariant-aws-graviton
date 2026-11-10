@@ -220,6 +220,7 @@ Alignment FastPassAligner::SswAlign(const string& target) const {
 }
 
 static const bool kSswBatch = getenv("FPA_NOBATCH") == nullptr;
+static const bool kFailMemo = getenv("FPA_NOFAILMEMO") == nullptr;
 
 std::vector<Alignment> FastPassAligner::SswAlignBatch(
     const std::vector<string>& targets) const {
@@ -271,6 +272,13 @@ void FastPassAligner::FastAlignReadsToHaplotype(
 
   bool is_ref = (haplotype == reference_);
   std::vector<int> coverage(haplotype.size(), 0);
+  // Per read, the last target position whose comparison failed (too many
+  // mismatches) on this haplotype. A failed comparison changes no state, and
+  // consecutive k-mers of a read land on the same target position and repeat
+  // the same comparison of the same strings, so a repeat of the last failure
+  // is skipped (deepvariant-aws-graviton#10). On chr20 this removes ~88% of the
+  // comparisons. FPA_NOFAILMEMO=1 restores the original.
+  if (kFailMemo) last_fail_.assign(reads_.size(), -1);
   // In the loop we try to align reads for each position in haplotype up to
   // lastPos.
   int lastPos = haplotype.length() - kmer_size_;
@@ -314,6 +322,10 @@ void FastPassAligner::FastAlignReadsToHaplotype(
           read_alignment.position == target_start_pos) {
         continue;
       }
+      if (kFailMemo && last_fail_[read_id_index] ==
+                           static_cast<int64_t>(target_start_pos)) {
+        continue;
+      }
       CHECK(target_start_pos + span <= haplotype.size());
       int num_of_mismatches = 0;
       int new_read_alignment_score = FastAlignStrings(
@@ -321,7 +333,9 @@ void FastPassAligner::FastAlignReadsToHaplotype(
           reads_[read_id_index],
           max_num_of_mismatches_ + 1, &num_of_mismatches);
 
-      if (num_of_mismatches <= max_num_of_mismatches_) {
+      if (num_of_mismatches > max_num_of_mismatches_) {
+        if (kFailMemo) last_fail_[read_id_index] = target_start_pos;
+      } else {
         CHECK(it.read_id.is_set &&
             read_id_index < haplotype_read_alignment_scores->size());
         int oldScore = read_alignment.score;
