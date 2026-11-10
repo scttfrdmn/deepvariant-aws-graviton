@@ -32,6 +32,10 @@
 // Implementation of allelecounter.h.
 #include "deepvariant/allelecounter.h"
 
+#if defined(__AVX512BW__)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -1276,7 +1280,51 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
               AlleleCount* const fc = cnt + io;
               const int fmbq = mbq, fio = io;
               const bool fleg = leg;
-              for (int i = lo; i < hi; ++i) {
+              int i = lo;
+#if defined(__AVX512BW__)
+              // 64 bases at a time: masks for canonical, reference-equal and
+              // base quality >= min (signed byte compares, as the scalar
+              // char-to-int reads), then the count bumps and pushes in base
+              // order. Same records as the scalar loop below.
+              {
+                const __m512i vA = _mm512_set1_epi8('A');
+                const __m512i vC = _mm512_set1_epi8('C');
+                const __m512i vG = _mm512_set1_epi8('G');
+                const __m512i vT = _mm512_set1_epi8('T');
+                const __m512i vq = _mm512_set1_epi8(
+                    static_cast<char>(std::min(std::max(fmbq, -128), 127)));
+                const bool q_in_range = fmbq >= -128 && fmbq <= 127;
+                for (; q_in_range && i + 64 <= hi; i += 64) {
+                  const __m512i c = _mm512_loadu_si512(fs + i);
+                  const __m512i r = _mm512_loadu_si512(fr + i);
+                  const __m512i qv = _mm512_loadu_si512(fq + i);
+                  const __mmask64 canon = _mm512_cmpeq_epi8_mask(c, vA) |
+                                          _mm512_cmpeq_epi8_mask(c, vC) |
+                                          _mm512_cmpeq_epi8_mask(c, vG) |
+                                          _mm512_cmpeq_epi8_mask(c, vT);
+                  const __mmask64 isref = _mm512_mask_cmpeq_epi8_mask(canon, c, r);
+                  const __mmask64 qok = _mm512_cmpge_epi8_mask(qv, vq);
+                  uint64_t inc = isref & qok;
+                  uint64_t push = canon & ~isref & (fleg ? qok : ~uint64_t{0});
+                  while (inc) {
+                    AlleleCount& ac = fc[i + __builtin_ctzll(inc)];
+                    ac.set_ref_supporting_read_count(
+                        ac.ref_supporting_read_count() + 1);
+                    inc &= inc - 1;
+                  }
+                  while (push) {
+                    const int j = i + __builtin_ctzll(push);
+                    const int q = fq[j];
+                    to_add.push_back(FastAllele{
+                        fio + j, AlleleType::SUBSTITUTION, !fleg && q < fmbq,
+                        mapq, static_cast<uint8_t>(q), reverse, false, 0, fs[j],
+                        -1});
+                    push &= push - 1;
+                  }
+                }
+              }
+#endif
+              for (; i < hi; ++i) {
                 const int q = fq[i];
                 if (q < fmbq && fleg) continue;
                 const char c = fs[i];
