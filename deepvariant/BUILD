@@ -1082,6 +1082,7 @@ cc_library(
     hdrs = ["pileup_image_native.h"],
     deps = [
         ":pileup_channel_lib",
+        "//deepvariant/channels:read_supports_variant_channel",
         ":sampling_util",
         "//deepvariant/protos:deepvariant_cc_pb2",
         "//third_party/nucleus/protos:cigar_cc_pb2",

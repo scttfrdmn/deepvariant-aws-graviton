@@ -167,6 +167,16 @@ class PileupImageEncoderNative {
   std::unique_ptr<ImageRow> EncodeReference(const string& ref_bases);
 
  private:
+  // aws-realign#130: env-gated capture (DV_DUMP_PILEUP) of one call's inputs and rows.
+  void DumpPileupCall(
+      const DeepVariantCall& dv_call, const string& ref_bases,
+      const std::vector<const ::nucleus::genomics::v1::Read*>& reads,
+      int image_start_pos, const std::vector<std::string>& alt_alleles,
+      int max_reads, const std::vector<int>& sampled_indices,
+      const std::vector<int64_t>* alignment_positions,
+      const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank,
+      const std::vector<std::unique_ptr<ImageRow>>& rows);
+
   int GetHapIndex(const nucleus::genomics::v1::Read& read);
 
   const PileupImageOptions options_;
