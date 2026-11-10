@@ -453,6 +453,7 @@ struct FlatScratch {
   std::vector<int> in_head, in_next, in_from, rstack;
   std::vector<uint8_t> fwd, rev;
   std::vector<int> pnode_v, pnode_parent, queue, terminated;
+  std::vector<int> bad_pos, bad_off;             // per-read bad positions (FlatBuild)
 };
 
 FlatScratch& Scratch() {
@@ -593,6 +594,20 @@ bool FlatBuild(absl::string_view ref,
     sc.read_spans.emplace_back(off, static_cast<int>(r->aligned_sequence().size()));
   }
   const absl::string_view all_bases(sc.read_bases);
+  // Bad positions (non-ACGT base or base quality below min_base_quality) of
+  // every read, found once here instead of once per k (#10); read r's are
+  // bad_pos[bad_off[r] .. bad_off[r + 1]), ascending.
+  sc.bad_pos.clear();
+  sc.bad_off.assign(1, 0);
+  for (size_t r = 0; r < sc.read_ptrs.size(); ++r) {
+    const absl::string_view bases = all_bases.substr(sc.read_spans[r].first, sc.read_spans[r].second);
+    const auto& qual = sc.read_ptrs[r]->aligned_quality();
+    for (int i = 0; i < static_cast<int>(bases.size()); ++i)
+      if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
+          qual[i] < options.min_base_quality())
+        sc.bad_pos.push_back(i);
+    sc.bad_off.push_back(static_cast<int>(sc.bad_pos.size()));
+  }
   static const bool early = !DbgEnv("DV_DBG_NOEARLY");
   for (int k = min_k; k <= max_k; k += options.step_k()) {
     FlatGraph& g = sc.g;
@@ -605,16 +620,15 @@ bool FlatBuild(absl::string_view ref,
     CHECK(source >= 0 && sink >= 0);
     bool cycle = false;
     for (size_t r = 0; r < sc.read_ptrs.size(); ++r) {
-      const Read& read = *sc.read_ptrs[r];
       const absl::string_view bases = all_bases.substr(sc.read_spans[r].first, sc.read_spans[r].second);
-      const auto& qual = read.aligned_quality();
       const int size = static_cast<int>(bases.size());
+      // next_bad(i): the first bad position >= i, or size. Successive calls
+      // ask for ascending i, so a cursor over the read's bad positions serves.
+      const int* bp = sc.bad_pos.data() + sc.bad_off[r];
+      const int* bp_end = sc.bad_pos.data() + sc.bad_off[r + 1];
       auto next_bad = [&](int start) -> int {
-        for (int i = start; i < size; ++i)
-          if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
-              qual[i] < options.min_base_quality())
-            return i;
-        return size;
+        while (bp != bp_end && *bp < start) ++bp;
+        return bp != bp_end ? *bp : size;
       };
       const int stop = size - k;
       int i = 0;
