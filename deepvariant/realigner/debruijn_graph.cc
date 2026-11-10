@@ -288,6 +288,10 @@ namespace {
 // 2-bit codes for upper-case ACGT; every other character (N, IUPAC, lower
 // case) is -1, and k-mers containing one are keyed by their string, so the
 // vertex identity is the k-mer string exactly as in the boost version.
+bool DbgEnv(const char* name);
+// DV_DBG_NO128=1: k-mers of 32 < k <= 64 keyed by string, as before (#10).
+const bool kDbgUse128 = !DbgEnv("DV_DBG_NO128");
+
 struct BaseCodes {
   int8_t c[256];
   BaseCodes() {
@@ -336,7 +340,7 @@ struct FlatGraph {
     mask128 = k >= 64 ? ~static_cast<unsigned __int128>(0)
                       : ((static_cast<unsigned __int128>(1) << (2 * k)) - 1);
     if (k <= 32) index64.reserve(hint);
-    else if (k <= 64) index128.reserve(hint);
+    else if (k <= 64 && kDbgUse128) index128.reserve(hint);
     else index.reserve(hint);
   }
   int NewVertex(absl::string_view km) {
@@ -374,7 +378,7 @@ struct FlatGraph {
         key = (key << 2) | c;
       }
       if (acgt) { auto it = index64.find(key); return it == index64.end() ? -1 : it->second; }
-    } else if (k <= 64) {
+    } else if (k <= 64 && kDbgUse128) {
       unsigned __int128 key = 0;
       bool acgt = true;
       for (char ch : km) {
@@ -416,7 +420,7 @@ struct FlatGraph {
       seen[v] = seg;
       return false;
     };
-    if (k > 32 && k <= 64) {
+    if (k > 32 && k <= 64 && kDbgUse128) {
       unsigned __int128 key = 0;
       int bad = start - 1;
       for (int j = start; j < start + k; ++j) {
@@ -591,8 +595,6 @@ bool FlatCandidateHaplotypes(FlatScratch& sc, int source, int sink,
   return true;
 }
 
-bool DbgEnv(const char* name);
-
 // Build() with the flat engine. Returns false if no k works (Build -> nullptr);
 // otherwise *k_used and *haplotypes.
 bool FlatBuild(absl::string_view ref,
@@ -621,7 +623,7 @@ bool FlatBuild(absl::string_view ref,
         if (bad < i) { if (!sc.ref_kmers64.insert(key).second) has_cycle = true; }
         else if (!sc.ref_kmers.insert(ref.substr(i, k)).second) has_cycle = true;
       }
-    } else if (k <= 64) {
+    } else if (k <= 64 && kDbgUse128) {
       sc.ref_kmers128.clear();
       sc.ref_kmers128.reserve(n_kmers);
       const unsigned __int128 mask = k >= 64 ? ~static_cast<unsigned __int128>(0)
@@ -679,6 +681,8 @@ bool FlatBuild(absl::string_view ref,
     sc.bad_off.push_back(static_cast<int>(sc.bad_pos.size()));
   }
   static const bool early = !DbgEnv("DV_DBG_NOEARLY");
+  // DV_DBG_NOBADPOS=1: scan each read for bad positions once per k, as before.
+  static const bool no_badpos = DbgEnv("DV_DBG_NOBADPOS");
   for (int k = min_k; k <= max_k; k += options.step_k()) {
     FlatGraph& g = sc.g;
     CHECK_GT(k, 0);
@@ -696,7 +700,15 @@ bool FlatBuild(absl::string_view ref,
       // ask for ascending i, so a cursor over the read's bad positions serves.
       const int* bp = sc.bad_pos.data() + sc.bad_off[r];
       const int* bp_end = sc.bad_pos.data() + sc.bad_off[r + 1];
+      const auto& qual = sc.read_ptrs[r]->aligned_quality();
       auto next_bad = [&](int start) -> int {
+        if (no_badpos) {
+          for (int i = start; i < size; ++i)
+            if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
+                qual[i] < options.min_base_quality())
+              return i;
+          return size;
+        }
         while (bp != bp_end && *bp < start) ++bp;
         return bp != bp_end ? *bp : size;
       };
