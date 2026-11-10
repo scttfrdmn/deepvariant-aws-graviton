@@ -381,6 +381,8 @@ class FastPassAligner {
   std::vector<uint32_t> kmer_start_;
   std::vector<KmerOccurrence> kmer_occ_;
   std::vector<uint64_t> hap_codes_;
+  // FastAlignReadsToHaplotype: last failed target position per read (#10).
+  std::vector<int64_t> last_fail_;
   std::vector<uint8_t> hap_valid_;
 
   // Vector of reads that need to be realigned

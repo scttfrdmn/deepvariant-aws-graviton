@@ -286,6 +286,8 @@ namespace {
 // 2-bit codes for upper-case ACGT; every other character (N, IUPAC, lower
 // case) is -1, and k-mers containing one are keyed by their string, so the
 // vertex identity is the k-mer string exactly as in the boost version.
+bool DbgEnv(const char* name);
+
 struct BaseCodes {
   int8_t c[256];
   BaseCodes() {
@@ -306,11 +308,20 @@ struct FlatGraph {
   absl::flat_hash_map<uint64_t, int> index64;             // k <= 32, ACGT
   std::vector<uint8_t> color;
   std::vector<std::pair<int, int>> stack;
+  // Closed-walk check (deepvariant-aws-graviton#10): seen[v] is the id of the
+  // last read segment that visited v. Consecutive k-mers of one segment are
+  // joined by edges, so a segment that revisits a vertex has walked a closed
+  // path, and a graph with a closed walk has a cycle: HasCycle() is then true
+  // for this k whatever the remaining reads add (edges are only ever added
+  // before HasCycle). DV_DBG_NOEARLY=1 builds every k to the end.
+  std::vector<int> seen;
+  int segment = 0;
 
   void Reset(int k_in, size_t hint) {
     k = k_in;
     mask = k >= 32 ? ~uint64_t{0} : ((uint64_t{1} << (2 * k)) - 1);
     kmer.clear(); head.clear(); tail.clear(); out_deg.clear(); edges.clear();
+    seen.clear(); segment = 0;
     index.clear();
     index64.clear();
     if (k <= 32) index64.reserve(hint); else index.reserve(hint);
@@ -319,6 +330,7 @@ struct FlatGraph {
     const int v = static_cast<int>(kmer.size());
     kmer.push_back(km);
     head.push_back(-1); tail.push_back(-1); out_deg.push_back(0);
+    seen.push_back(0);
     return v;
   }
   int EnsureStr(absl::string_view km) {
@@ -362,19 +374,31 @@ struct FlatGraph {
     tail[from] = id;
     out_deg[from]++;
   }
-  void AddKmersAndEdges(absl::string_view bases, int start, int end, bool is_ref) {
+  // Returns true iff check_walk and this segment revisited one of its own
+  // vertices (a closed walk, so the graph has a cycle at this k).
+  bool AddKmersAndEdges(absl::string_view bases, int start, int end, bool is_ref,
+                        bool check_walk = false) {
     CHECK_GE(start, 0);
     CHECK_LE(start + k, bases.size());
     CHECK_LE(end + k, bases.size());
-    if (end <= 0) return;
+    if (end <= 0) return false;
+    const int seg = check_walk ? ++segment : 0;
+    auto visit = [&](int v) {
+      if (!check_walk) return false;
+      if (seen[v] == seg) return true;
+      seen[v] = seg;
+      return false;
+    };
     if (k > 32) {
       int prev = EnsureStr(bases.substr(start, k));
+      bool closed = visit(prev);
       for (int i = start + 1; i <= end; ++i) {
         const int cur = EnsureStr(bases.substr(i, k));
         AddEdge(prev, cur, is_ref);
+        closed |= visit(cur);
         prev = cur;
       }
-      return;
+      return closed;
     }
     // Rolling 2-bit key over k-mers bases[i, i + k); `bad` is the last index
     // with a non-ACGT character, so k-mer i is all-ACGT iff bad < i.
@@ -389,14 +413,17 @@ struct FlatGraph {
       return bad < i ? Ensure64(key, bases.substr(i, k)) : EnsureStr(bases.substr(i, k));
     };
     int prev = vertex_at(start);
+    bool closed = visit(prev);
     for (int i = start + 1; i <= end; ++i) {
       const int j = i + k - 1;
       const int8_t c = kCodes.c[static_cast<uint8_t>(bases[j])];
       if (c < 0) { bad = j; key = (key << 2) & mask; } else { key = ((key << 2) | c) & mask; }
       const int cur = vertex_at(i);
       AddEdge(prev, cur, is_ref);
+      closed |= visit(cur);
       prev = cur;
     }
+    return closed;
   }
   bool HasCycle() {
     const int n = static_cast<int>(kmer.size());
@@ -429,6 +456,7 @@ struct FlatScratch {
   std::vector<int> in_head, in_next, in_from, rstack;
   std::vector<uint8_t> fwd, rev;
   std::vector<int> pnode_v, pnode_parent, queue, terminated;
+  std::vector<int> bad_pos, bad_off;             // per-read bad positions (FlatBuild)
 };
 
 // One scratch per thread, but not through a plain thread_local: in a dlopen'ed
@@ -582,6 +610,23 @@ bool FlatBuild(absl::string_view ref,
     sc.read_spans.emplace_back(off, static_cast<int>(r->aligned_sequence().size()));
   }
   const absl::string_view all_bases(sc.read_bases);
+  // Bad positions (non-ACGT base or base quality below min_base_quality) of
+  // every read, found once here instead of once per k (#10); read r's are
+  // bad_pos[bad_off[r] .. bad_off[r + 1]), ascending.
+  sc.bad_pos.clear();
+  sc.bad_off.assign(1, 0);
+  for (size_t r = 0; r < sc.read_ptrs.size(); ++r) {
+    const absl::string_view bases = all_bases.substr(sc.read_spans[r].first, sc.read_spans[r].second);
+    const auto& qual = sc.read_ptrs[r]->aligned_quality();
+    for (int i = 0; i < static_cast<int>(bases.size()); ++i)
+      if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
+          qual[i] < options.min_base_quality())
+        sc.bad_pos.push_back(i);
+    sc.bad_off.push_back(static_cast<int>(sc.bad_pos.size()));
+  }
+  static const bool early = !DbgEnv("DV_DBG_NOEARLY");
+  // DV_DBG_NOBADPOS=1: scan each read for bad positions once per k, as before.
+  static const bool no_badpos = DbgEnv("DV_DBG_NOBADPOS");
   for (int k = min_k; k <= max_k; k += options.step_k()) {
     FlatGraph& g = sc.g;
     CHECK_GT(k, 0);
@@ -591,27 +636,36 @@ bool FlatBuild(absl::string_view ref,
     const int source = g.Find(ref.substr(0, k));
     const int sink = g.Find(ref.substr(ref.size() - k, k));
     CHECK(source >= 0 && sink >= 0);
+    bool cycle = false;
     for (size_t r = 0; r < sc.read_ptrs.size(); ++r) {
-      const Read& read = *sc.read_ptrs[r];
       const absl::string_view bases = all_bases.substr(sc.read_spans[r].first, sc.read_spans[r].second);
-      const auto& qual = read.aligned_quality();
       const int size = static_cast<int>(bases.size());
+      // next_bad(i): the first bad position >= i, or size. Successive calls
+      // ask for ascending i, so a cursor over the read's bad positions serves.
+      const int* bp = sc.bad_pos.data() + sc.bad_off[r];
+      const int* bp_end = sc.bad_pos.data() + sc.bad_off[r + 1];
+      const auto& qual = sc.read_ptrs[r]->aligned_quality();
       auto next_bad = [&](int start) -> int {
-        for (int i = start; i < size; ++i)
-          if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
-              qual[i] < options.min_base_quality())
-            return i;
-        return size;
+        if (no_badpos) {
+          for (int i = start; i < size; ++i)
+            if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
+                qual[i] < options.min_base_quality())
+              return i;
+          return size;
+        }
+        while (bp != bp_end && *bp < start) ++bp;
+        return bp != bp_end ? *bp : size;
       };
       const int stop = size - k;
       int i = 0;
       while (i < stop) {
         const int nb = next_bad(i);
-        g.AddKmersAndEdges(bases, i, nb - k, false);
+        cycle |= g.AddKmersAndEdges(bases, i, nb - k, false, early);
         i = nb + 1;
       }
+      if (cycle) break;  // HasCycle() would be true: next k
     }
-    if (g.HasCycle()) continue;
+    if (cycle || g.HasCycle()) continue;
     *k_used = k;
     return FlatCandidateHaplotypes(sc, source, sink, options, haplotypes);
   }
