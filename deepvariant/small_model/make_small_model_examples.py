@@ -32,6 +32,7 @@ from collections.abc import Sequence
 import dataclasses
 import enum
 import itertools
+import os
 
 import tensorflow as tf
 
@@ -563,6 +564,144 @@ class SmallModelExampleFactory:
     self.expand_by_haplotype = expand_by_haplotype
     self.vaf_context_window_size = vaf_context_window_size
     self.model_features = self._get_and_validate_model_features(model_features)
+    self._fast_plan = self._make_fast_plan()
+
+  def _make_fast_plan(self):
+    """The selected features in encoded order, for the one-sample path.
+
+    _encode_model_features keeps the features of _encode_candidate_feature_dict
+    that are in model_features, in the dict's insertion order. With one sample
+    and no haplotype expansion that order is BaseFeature, VariantFeature, then
+    the context VAF offsets. The plan lists the selected ones as (kind, key) so
+    a candidate computes only those, with the same arithmetic
+    (deepvariant-aws-graviton#10). DV_SMALL_MODEL_FAST=0 keeps the dict path.
+    """
+    if os.environ.get('DV_SMALL_MODEL_FAST') == '0':
+      return None
+    if len(self.sample_names) > 1 or self.expand_by_haplotype:
+      return None
+    selected = set(self.model_features)
+    plan = [('base', f) for f in BaseFeature if f.value in selected]
+    plan += [('variant', f) for f in VariantFeature if f.value in selected]
+    for offset in _get_context_allele_frequency_offsets(
+        self.vaf_context_window_size
+    ):
+      direction = 'minus' if offset < 0 else 'plus'
+      name = f'variant_allele_frequency_at_{direction}_{abs(offset)}'
+      if name in selected:
+        plan.append(('vaf', offset))
+    # Every selected feature must be in the plan, or the plan is not the dict.
+    if len(plan) != len(selected):
+      return None
+    return plan
+
+  def _encode_model_features_fast(
+      self,
+      candidate: deepvariant_pb2.DeepVariantCall,
+      alt_allele_indices: tuple[int, ...],
+  ) -> list[int]:
+    """_encode_model_features for one sample, no haplotypes, same values."""
+    variant = candidate.variant
+    alternate_bases = variant.alternate_bases
+    allele_support_ext = candidate.allele_support_ext
+    ref_infos = candidate.ref_support_ext.read_infos
+    alt_infos = []
+    for allele_index in alt_allele_indices:
+      alt_base = alternate_bases[allele_index]
+      if alt_base not in allele_support_ext:
+        raise ValueError(f'Alt base "{alt_base}" not found in candidate.')
+      alt_infos.extend(allele_support_ext[alt_base].read_infos)
+    # FeatureEncoder also gathers every alt allele's reads (and raises the same
+    # error for a missing one); keep that check.
+    for alt_base in alternate_bases:
+      if alt_base not in allele_support_ext:
+        raise ValueError(f'Alt base "{alt_base}" not found in candidate.')
+    n_ref = len(ref_infos)
+    n_alt = len(alt_infos)
+    sums = None
+    exclude_alleles = None
+    out = []
+    afp = None
+    for kind, key in self._fast_plan:
+      if kind == 'vaf':
+        if afp is None:
+          afp = candidate.allele_frequency_at_position
+          start = variant.start
+        out.append(afp.get(start + key, 0))
+        continue
+      if kind == 'variant':
+        if exclude_alleles is None:
+          exclude_alleles = get_exclude_alleles(candidate, alt_allele_indices)
+        if key == VariantFeature.IS_SNP:
+          out.append(int(variant_utils.is_snp(variant, exclude_alleles)))
+        elif key == VariantFeature.IS_INSERTION:
+          out.append(
+              int(variant_utils.variant_is_insertion(variant, exclude_alleles))
+          )
+        elif key == VariantFeature.IS_DELETION:
+          out.append(
+              int(variant_utils.variant_is_deletion(variant, exclude_alleles))
+          )
+        elif key == VariantFeature.INSERTION_LENGTH:
+          out.append(max(0, max(
+              len(alternate_bases[i]) - len(variant.reference_bases)
+              for i in alt_allele_indices
+          )))
+        elif key == VariantFeature.DELETION_LENGTH:
+          out.append(max(0, max(
+              len(variant.reference_bases) - len(alternate_bases[i])
+              for i in alt_allele_indices
+          )))
+        elif key == VariantFeature.IS_MULTIALLELIC:
+          out.append(int(variant_utils.is_multiallelic(variant)))
+        elif key == VariantFeature.IS_MULTIPLE_ALT_ALLELES:
+          out.append(int(len(alt_allele_indices) > 1))
+        else:
+          raise ValueError(f'{key.value} does not map to a callable.')
+        continue
+      if key == BaseFeature.NUM_READS_SUPPORTS_REF:
+        out.append(n_ref)
+      elif key == BaseFeature.NUM_READS_SUPPORTS_ALT:
+        out.append(n_alt)
+      elif key == BaseFeature.ALT_INDICES_DEPTH:
+        out.append(n_ref + n_alt)
+      elif key == BaseFeature.TOTAL_DEPTH:
+        out.append(n_ref + sum(
+            len(r.read_infos) for r in allele_support_ext.values()))
+      elif key == BaseFeature.VARIANT_ALLELE_FREQUENCY:
+        dp = n_ref + sum(len(r.read_infos) for r in allele_support_ext.values())
+        out.append(100 * n_alt // dp if dp else 0)
+      elif key == BaseFeature.ALT_INDICES_VARIANT_ALLELE_FREQUENCY:
+        dp = n_ref + n_alt
+        out.append(100 * n_alt // dp if dp else 0)
+      else:
+        if sums is None:
+          # One pass per read list for the three per-read attributes; integer
+          # sums, as sum(getattr(...)) in _mean_for_attribute.
+          sums = []
+          for infos in (ref_infos, alt_infos):
+            mq = bq = rs = 0
+            for r in infos:
+              mq += r.mapping_quality
+              bq += r.average_base_quality
+              rs += r.is_reverse_strand
+            sums.append((mq, bq, rs, len(infos)))
+        (rmq, rbq, rrs, rn), (amq, abq, ars, an) = sums
+        if key == BaseFeature.REF_MAPPING_QUALITY:
+          out.append(rmq // rn if rn else 0)
+        elif key == BaseFeature.ALT_MAPPING_QUALITY:
+          out.append(amq // an if an else 0)
+        elif key == BaseFeature.REF_BASE_QUALITY:
+          out.append(rbq // rn if rn else 0)
+        elif key == BaseFeature.ALT_BASE_QUALITY:
+          out.append(abq // an if an else 0)
+        elif key == BaseFeature.REF_REVERSE_STRAND_RATIO:
+          out.append(100 * rrs // rn if rn else 0)
+        elif key == BaseFeature.ALT_REVERSE_STRAND_RATIO:
+          out.append(100 * ars // an if an else 0)
+        else:
+          raise ValueError(f'{key.value} does not map to a callable.')
+    return out
 
   def _get_and_validate_model_features(
       self,
@@ -788,8 +927,13 @@ class SmallModelExampleFactory:
         example_set.candidates_with_alt_allele_indices.append(
             (candidate, alt_allele_indices)
         )
-        candidate_example = self._encode_model_features(
-            candidate, alt_allele_indices, read_phases, sample_order
-        )
+        if self._fast_plan is not None:
+          candidate_example = self._encode_model_features_fast(
+              candidate, alt_allele_indices
+          )
+        else:
+          candidate_example = self._encode_model_features(
+              candidate, alt_allele_indices, read_phases, sample_order
+          )
         example_set.inference_examples.append(candidate_example)
     return example_set

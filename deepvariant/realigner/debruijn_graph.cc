@@ -44,6 +44,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -430,7 +431,22 @@ struct FlatScratch {
   std::vector<int> pnode_v, pnode_parent, queue, terminated;
 };
 
+// One scratch per thread, but not through a plain thread_local: in a dlopen'ed
+// .so that is __tls_get_addr, and after other modules are dlopen'ed glibc takes
+// its slow path (a DTV update walking the loaded modules) on such calls, ~2% of
+// make_examples at one call per window. make_examples realigns from one thread,
+// so the first thread to ask gets a process-wide instance (a plain static) and
+// any other thread its own thread_local. Memory reuse only; outputs unchanged
+// (deepvariant-aws-graviton#10).
 FlatScratch& Scratch() {
+  static const std::thread::id first_thread = std::this_thread::get_id();
+  // DV_TLS_SCRATCH=1: always the thread_local (the previous behaviour).
+  static const bool tls_only = std::getenv("DV_TLS_SCRATCH") != nullptr &&
+                               std::getenv("DV_TLS_SCRATCH")[0] == '1';
+  if (!tls_only && std::this_thread::get_id() == first_thread) {
+    static FlatScratch shared;
+    return shared;
+  }
   static thread_local FlatScratch s;
   return s;
 }
