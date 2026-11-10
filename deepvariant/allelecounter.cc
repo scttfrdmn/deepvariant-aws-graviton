@@ -689,6 +689,34 @@ void AlleleCounter::AddReadAllelesFast(const Read& read,
       }
       auto* read_alleles = allele_count.mutable_read_alleles();
       auto* sample_alleles = allele_count.mutable_sample_alleles();
+      if (!kNoAcFuse) {
+        // The map entry filled in place with MakeAllele's fields (all of
+        // Allele's), then copied once into sample_alleles: no temporary
+        // Allele and its bases string (#10).
+        if (read_alleles->count(key)) {
+          static int counter = 0;
+          if (counter++ < 1) {
+            VLOG(2) << "Found duplicate read: " << key << " at "
+                    << allele_count.position().ShortDebugString();
+          }
+        }
+        const absl::string_view bases =
+            a.indel >= 0 ? absl::string_view(indels[a.indel].bases())
+                         : absl::string_view(&a.base, 1);
+        Allele& dst = (*read_alleles)[key];
+        dst.set_bases(bases.data(), bases.size());
+        dst.set_type(a.type);
+        dst.set_count(1);
+        dst.set_is_low_quality(a.is_low_quality);
+        dst.set_mapping_quality(a.mapping_quality);
+        dst.set_avg_base_quality(a.avg_base_quality);
+        dst.set_is_reverse_strand(a.is_reverse_strand);
+        dst.set_is_methylated(a.is_methylated);
+        dst.set_methylation_level(
+            static_cast<int>(static_cast<float>(a.methylation_level)));
+        *(*sample_alleles)[sample_key].add_alleles() = dst;
+        continue;
+      }
       const Allele allele =
           a.indel >= 0
               ? MakeAllele(indels[a.indel].bases(), a.type, 1, a.is_low_quality,

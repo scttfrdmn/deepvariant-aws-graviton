@@ -84,10 +84,29 @@ bool SortByAlignment(
          std::tuple<int, int>(std::get<0>(b), position2);
 }
 
+namespace {
+// DV_ROW_INPLACE=0: ImageRows built as before (fill constructor from a
+// temporary, empty rows copied from a temporary ImageRow).
+bool RowInPlace() {
+  static const bool on = [] {
+    const char* v = std::getenv("DV_ROW_INPLACE");
+    return v == nullptr || std::string(v) != "0";
+  }();
+  return on;
+}
+}  // namespace
+
 ImageRow::ImageRow(int width, int num_channels)
-    : width(width),
-      num_channels(num_channels),
-      channel_data(num_channels, std::vector<unsigned char>(width, 0)) {}
+    : width(width), num_channels(num_channels) {
+  if (!RowInPlace()) {
+    channel_data.assign(num_channels, std::vector<unsigned char>(width, 0));
+    return;
+  }
+  // Each channel built in place: the same zero-filled rows without the
+  // temporary vector that the fill constructor copies from (#10).
+  channel_data.reserve(num_channels);
+  for (int c = 0; c < num_channels; ++c) channel_data.emplace_back(width, 0);
+}
 
 int ImageRow::Width() const { return width; }
 
@@ -305,8 +324,13 @@ PileupImageEncoderNative::BuildPileupForOneSample(
   const int num_channels = channel_enums_.size();  // == AllChannelsEnum("").size()
   if (empty_rows > 0) {
     for (int i = 0; i < empty_rows; i++) {
-      rows.push_back(std::make_unique<ImageRow>(
-          ImageRow(ref_bases.size(), num_channels)));
+      // Constructed in place (no temporary ImageRow to copy) (#10).
+      if (RowInPlace())
+        rows.push_back(
+            std::make_unique<ImageRow>(ref_bases.size(), num_channels));
+      else
+        rows.push_back(std::make_unique<ImageRow>(
+            ImageRow(ref_bases.size(), num_channels)));
     }
   }
 
