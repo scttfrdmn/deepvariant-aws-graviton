@@ -268,6 +268,14 @@ class ExamplesGenerator {
 
   // StreamExamples class handles the output to shared memory buffer.
   std::unique_ptr<StreamExamples> stream_examples_;
+
+  // aws-realign#130 fused GPU hand-off (DV_FUSED_OUT=<dir>): one compact
+  // record per example (variant, alt allele indices, the pileup's inputs) in
+  // <dir>/fused-<examples file name>, for deepvariant/gpu/fused_call_variants.
+  // DV_FUSED_ONLY=1 writes no examples (no images on the CPU); DV_FUSED_ROWS=1
+  // adds the CPU's rows to each record (image gate).
+  struct FusedOut;
+  std::unique_ptr<FusedOut> fused_;
 };
 
 // Helper class to allow unit testing of some private methods.

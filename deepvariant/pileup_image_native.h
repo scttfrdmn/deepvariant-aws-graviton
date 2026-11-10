@@ -166,6 +166,17 @@ class PileupImageEncoderNative {
   // Encode the reference bases into a single row of pixels.
   std::unique_ptr<ImageRow> EncodeReference(const string& ref_bases);
 
+  // aws-realign#130 fused GPU hand-off: while a sink is set,
+  // BuildPileupForOneSample appends its compact record (options, reference
+  // window, sampled reads; the CPU's rows too if with_rows) to *sink. With
+  // skip_rows it stops after read sampling and returns no rows: the image is
+  // built on the GPU from the record (deepvariant/gpu/).
+  void SetFusedSink(std::string* sink, bool with_rows, bool skip_rows) {
+    fused_sink_ = sink;
+    fused_with_rows_ = with_rows;
+    fused_skip_rows_ = skip_rows;
+  }
+
  private:
   // aws-realign#130: env-gated capture (DV_DUMP_PILEUP) of one call's inputs and rows.
   void DumpPileupCall(
@@ -175,13 +186,17 @@ class PileupImageEncoderNative {
       int max_reads, const std::vector<int>& sampled_indices,
       const std::vector<int64_t>* alignment_positions,
       const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank,
-      const std::vector<std::unique_ptr<ImageRow>>& rows);
+      int pileup_height, const std::vector<std::unique_ptr<ImageRow>>& rows);
 
   int GetHapIndex(const nucleus::genomics::v1::Read& read);
 
   const PileupImageOptions options_;
   // Exact table-driven read encoder, when the channel set allows it (#10).
   std::shared_ptr<const FastReadEncoder> fast_encoder_;
+  // Fused hand-off sink (SetFusedSink).
+  std::string* fused_sink_ = nullptr;
+  bool fused_with_rows_ = false;
+  bool fused_skip_rows_ = false;
 };
 
 // Exact fast pileup path (deepvariant-aws-graviton#10): per-read channels

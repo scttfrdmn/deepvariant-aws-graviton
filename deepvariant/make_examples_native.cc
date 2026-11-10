@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -62,6 +63,8 @@
 #include "tensorflow/core/example/example.pb.h"
 #include "tensorflow/core/example/feature.pb.h"
 #include "re2/re2.h"
+#include "tensorflow/core/lib/io/record_writer.h"
+#include "tensorflow/core/platform/env.h"
 
 namespace learning {
 namespace genomics {
@@ -74,6 +77,18 @@ using Read = nucleus::genomics::v1::Read;
 constexpr int kDefaultMinimumReadOverlap = 15;
 
 // ExamplesGenerator is initialized once per each make_examples instance.
+struct ExamplesGenerator::FusedOut {
+  std::unique_ptr<tensorflow::WritableFile> file;
+  std::unique_ptr<tensorflow::io::RecordWriter> writer;
+  std::string path;
+  bool only = false;
+  bool rows = false;
+  std::string pile;  // BuildPileupForOneSample's record for the current example
+  std::string rec;   // the framed record
+  int64_t n = 0;
+  int64_t bytes = 0;
+};
+
 ExamplesGenerator::ExamplesGenerator(
     const MakeExamplesOptions& options,
     const std::unordered_map<std::string, std::string>& example_filenames,
@@ -163,11 +178,45 @@ ExamplesGenerator::ExamplesGenerator(
       if (!sample.writer->status().ok()) {
         LOG(FATAL) << "Failed to create Example writer for " << it->second;
       }
+      const char* fused_dir = std::getenv("DV_FUSED_OUT");
+      if (fused_dir != nullptr && *fused_dir != 0) {
+        CHECK(fused_ == nullptr) << "DV_FUSED_OUT supports one sample";
+        fused_ = std::make_unique<FusedOut>();
+        const std::string& ex = it->second;
+        fused_->path = absl::StrCat(fused_dir, "/fused-",
+                                    ex.substr(ex.find_last_of('/') + 1));
+        const char* only = std::getenv("DV_FUSED_ONLY");
+        const char* rows = std::getenv("DV_FUSED_ROWS");
+        const char* level = std::getenv("DV_FUSED_GZ_LEVEL");
+        fused_->only = only != nullptr && std::string(only) == "1";
+        fused_->rows = rows != nullptr && std::string(rows) == "1";
+        auto st = tensorflow::Env::Default()->NewWritableFile(fused_->path,
+                                                              &fused_->file);
+        if (!st.ok()) LOG(FATAL) << "Failed to create " << fused_->path;
+        auto opts =
+            tensorflow::io::RecordWriterOptions::CreateRecordWriterOptions(
+                "GZIP");
+        opts.zlib_options.compression_level =
+            level != nullptr ? std::atoi(level) : 1;
+        fused_->writer = std::make_unique<tensorflow::io::RecordWriter>(
+            fused_->file.get(), opts);
+        LOG(INFO) << "Fused hand-off records to " << fused_->path
+                  << (fused_->only ? " (no examples)" : "")
+                  << (fused_->rows ? " (with rows)" : "");
+      }
     }
   }
 }
 
 ExamplesGenerator::~ExamplesGenerator() {
+  if (fused_ != nullptr) {
+    if (!fused_->writer->Close().ok() || !fused_->file->Close().ok()) {
+      LOG(FATAL) << "Failed to close " << fused_->path;
+    }
+    LOG(INFO) << "Fused hand-off: " << fused_->n << " records, "
+              << fused_->bytes << " bytes before compression, to "
+              << fused_->path;
+  }
   if (!options_.stream_examples()) {
     for (auto& [role, sample] : samples_) {
       if (sample.sample_options.skip_output_generation()) {
@@ -712,6 +761,13 @@ void ExamplesGenerator::CreateAndWriteExamplesForCandidate(
               channel_enum_descriptor->value(i)->number()));
         }
       }
+      if (fused_ != nullptr) {
+        CHECK_EQ(sample_order.size(), 1u) << "DV_FUSED_OUT supports one sample";
+        CHECK(!variant_needs_alt_alignment)
+            << "DV_FUSED_OUT does not support alt-aligned pileups";
+        fused_->pile.clear();
+        pileup_image_.SetFusedSink(&fused_->pile, fused_->rows, fused_->only);
+      }
       auto ref_image = pileup_image_.BuildPileupForOneSample(
           candidate, reference_bases,
           use_trimmed_reads ? std::move(trimmed_reads_ptrs)
@@ -719,6 +775,7 @@ void ExamplesGenerator::CreateAndWriteExamplesForCandidate(
           image_start_pos, alt_combination,
           options_.sample_options(this_sample_order), mean_coverage,
           &original_start_positions, blank_channels_set);
+      if (fused_ != nullptr) pileup_image_.SetFusedSink(nullptr, false, false);
       // Collect rows from all samples in ref_images.
       for (auto& row : ref_image) {
         ref_images.push_back(std::move(row));
@@ -740,6 +797,36 @@ void ExamplesGenerator::CreateAndWriteExamplesForCandidate(
                                  this_sample_order, region, alt_images,
                                  mean_coverage, nullptr);
         }
+      }
+    }
+    if (fused_ != nullptr) {
+      // Record: "FUS1", rows flag, variant/encoded, alt_allele_indices/encoded,
+      // then the pileup record (deepvariant/gpu/fused_call_variants.cc).
+      const std::string v = EncodeVariant(variant, nullptr);
+      const std::string a = EncodeAltAlleles(variant, alt_combination, nullptr);
+      std::string& r = fused_->rec;
+      r.clear();
+      auto put32 = [&r](uint32_t x) {
+        r.append(reinterpret_cast<const char*>(&x), sizeof(x));
+      };
+      put32(0x31535546);  // "FUS1"
+      r.push_back(fused_->rows ? 1 : 0);
+      put32(v.size()); r.append(v);
+      put32(a.size()); r.append(a);
+      r.append(fused_->pile);
+      if (!fused_->writer->WriteRecord(r).ok()) {
+        LOG(FATAL) << "Failed to write " << fused_->path;
+      }
+      fused_->n++;
+      fused_->bytes += r.size();
+      if (fused_->only) {
+        int pileup_height = sample.sample_options.pileup_height();
+        if (pileup_height == 0) pileup_height = options_.pic_options().height();
+        image_shape[0] = pileup_height;
+        image_shape[1] = reference_bases.size();
+        image_shape[2] = options_.pic_options().channels().size();
+        UpdateStats(encoded_variant_type, nullptr, 0, stats);
+        continue;
       }
     }
     if (options_.stream_examples()) {

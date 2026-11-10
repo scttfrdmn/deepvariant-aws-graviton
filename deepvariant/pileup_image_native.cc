@@ -219,8 +219,8 @@ absl::StatusOr<std::vector<int>> DownsampleReadIndicesWithMinsPerAllele(
 // encoder can be gated bit-for-bit against this code on real candidates.
 namespace {
 template <typename T>
-void DumpPod(FILE* f, const T& v) { fwrite(&v, sizeof(T), 1, f); }
-void DumpBytes(FILE* f, absl::string_view s) { fwrite(s.data(), 1, s.size(), f); }
+void DumpPod(std::string* b, const T& v) { b->append(reinterpret_cast<const char*>(&v), sizeof(T)); }
+void DumpBytes(std::string* b, absl::string_view s) { b->append(s.data(), s.size()); }
 FILE* PileupDumpFile() {
   static FILE* f = [] () -> FILE* {
     const char* p = std::getenv("DV_DUMP_PILEUP");
@@ -232,6 +232,11 @@ FILE* PileupDumpFile() {
 }
 }  // namespace
 
+// One record: options, reference window, sampled reads in sampled order (all
+// of them: the encoder applies the read filters and max_reads itself), then,
+// for the capture file and for a fused sink with rows, the CPU's rows
+// (channel-major per row). Read by deepvariant/gpu/pileup_gpu_harness.cc and
+// deepvariant/gpu/fused_call_variants.cc.
 void PileupImageEncoderNative::DumpPileupCall(
     const DeepVariantCall& dv_call, const string& ref_bases,
     const std::vector<const Read*>& reads, int image_start_pos,
@@ -239,49 +244,57 @@ void PileupImageEncoderNative::DumpPileupCall(
     const std::vector<int>& sampled_indices,
     const std::vector<int64_t>* alignment_positions,
     const absl::flat_hash_set<DeepVariantChannelEnum>& channels_enum_to_blank,
-    const std::vector<std::unique_ptr<ImageRow>>& rows) {
+    int pileup_height, const std::vector<std::unique_ptr<ImageRow>>& rows) {
   FILE* f = PileupDumpFile();
-  if (f == nullptr) return;
+  if (f == nullptr && fused_sink_ == nullptr) return;
+  std::string local;
+  std::string* b = fused_sink_ != nullptr ? fused_sink_ : &local;
+  const size_t b0 = b->size();
   const auto& o = options_;
-  DumpPod(f, uint32_t{0x454c4950});  // "PILE"
-  DumpPod(f, int32_t(ref_bases.size())); DumpPod(f, int32_t(rows.size()));
-  DumpPod(f, int32_t(o.reference_band_height()));
-  DumpPod(f, int32_t(channel_enums_.size()));
-  for (auto e : channel_enums_) DumpPod(f, int32_t(e));
-  DumpPod(f, int32_t(o.base_color_offset_a_and_g())); DumpPod(f, int32_t(o.base_color_offset_t_and_c()));
-  DumpPod(f, int32_t(o.base_color_stride())); DumpPod(f, int32_t(o.reference_base_quality()));
-  DumpPod(f, float(o.base_quality_cap())); DumpPod(f, float(o.mapping_quality_cap()));
-  DumpPod(f, int32_t(o.positive_strand_color())); DumpPod(f, int32_t(o.negative_strand_color()));
-  DumpPod(f, float(o.allele_supporting_read_alpha())); DumpPod(f, float(o.allele_unsupporting_read_alpha()));
-  DumpPod(f, float(o.other_allele_supporting_read_alpha()));
-  DumpPod(f, float(o.reference_matching_read_alpha())); DumpPod(f, float(o.reference_mismatching_read_alpha()));
-  DumpPod(f, uint8_t(o.indel_anchoring_base_char()[0]));
-  DumpPod(f, int32_t(o.read_requirements().min_mapping_quality()));
-  DumpPod(f, int32_t(o.read_requirements().min_base_quality()));
-  DumpPod(f, int32_t(channels_enum_to_blank.size()));
-  DumpPod(f, int64_t(dv_call.variant().start())); DumpPod(f, int32_t(image_start_pos));
-  DumpBytes(f, ref_bases);
-  DumpPod(f, int32_t(max_reads)); DumpPod(f, int32_t(sampled_indices.size()));
+  DumpPod(b, uint32_t{0x454c4950});  // "PILE"
+  DumpPod(b, int32_t(ref_bases.size())); DumpPod(b, int32_t(pileup_height));
+  DumpPod(b, int32_t(o.reference_band_height()));
+  DumpPod(b, int32_t(channel_enums_.size()));
+  for (auto e : channel_enums_) DumpPod(b, int32_t(e));
+  DumpPod(b, int32_t(o.base_color_offset_a_and_g())); DumpPod(b, int32_t(o.base_color_offset_t_and_c()));
+  DumpPod(b, int32_t(o.base_color_stride())); DumpPod(b, int32_t(o.reference_base_quality()));
+  DumpPod(b, float(o.base_quality_cap())); DumpPod(b, float(o.mapping_quality_cap()));
+  DumpPod(b, int32_t(o.positive_strand_color())); DumpPod(b, int32_t(o.negative_strand_color()));
+  DumpPod(b, float(o.allele_supporting_read_alpha())); DumpPod(b, float(o.allele_unsupporting_read_alpha()));
+  DumpPod(b, float(o.other_allele_supporting_read_alpha()));
+  DumpPod(b, float(o.reference_matching_read_alpha())); DumpPod(b, float(o.reference_mismatching_read_alpha()));
+  DumpPod(b, uint8_t(o.indel_anchoring_base_char()[0]));
+  DumpPod(b, int32_t(o.read_requirements().min_mapping_quality()));
+  DumpPod(b, int32_t(o.read_requirements().min_base_quality()));
+  DumpPod(b, int32_t(channels_enum_to_blank.size()));
+  DumpPod(b, int64_t(dv_call.variant().start())); DumpPod(b, int32_t(image_start_pos));
+  DumpBytes(b, ref_bases);
+  DumpPod(b, int32_t(max_reads)); DumpPod(b, int32_t(sampled_indices.size()));
   ReadSupportsVariantChannel support(ref_bases.size(), options_);
   for (int index : sampled_indices) {
     const Read& r = *reads[index];
     int64_t sort_pos = (alignment_positions == nullptr || alignment_positions->empty())
                            ? r.alignment().position().position() : alignment_positions->at(index);
-    DumpPod(f, int32_t(sort_pos)); DumpPod(f, int32_t(GetHapIndex(r)));
-    DumpPod(f, int32_t(r.alignment().position().position()));
-    DumpPod(f, int32_t(r.alignment().mapping_quality()));
-    DumpPod(f, uint8_t(r.alignment().position().reverse_strand()));
-    DumpPod(f, int32_t(r.fragment_length())); DumpPod(f, int32_t(r.read_number()));
-    DumpPod(f, uint16_t(r.fragment_name().size())); DumpBytes(f, r.fragment_name());
-    DumpPod(f, uint8_t(support.ReadSupportsAlt(dv_call, r, alt_alleles)));
-    DumpPod(f, int32_t(r.alignment().cigar_size()));
-    for (const auto& c : r.alignment().cigar()) { DumpPod(f, uint8_t(c.operation())); DumpPod(f, int32_t(c.operation_length())); }
-    DumpPod(f, int32_t(r.aligned_sequence().size())); DumpBytes(f, r.aligned_sequence());
-    DumpPod(f, int32_t(r.aligned_quality().size()));
-    for (auto q : r.aligned_quality()) DumpPod(f, uint8_t(q));
+    DumpPod(b, int32_t(sort_pos)); DumpPod(b, int32_t(GetHapIndex(r)));
+    DumpPod(b, int32_t(r.alignment().position().position()));
+    DumpPod(b, int32_t(r.alignment().mapping_quality()));
+    DumpPod(b, uint8_t(r.alignment().position().reverse_strand()));
+    DumpPod(b, int32_t(r.fragment_length())); DumpPod(b, int32_t(r.read_number()));
+    DumpPod(b, uint16_t(r.fragment_name().size())); DumpBytes(b, r.fragment_name());
+    DumpPod(b, uint8_t(support.ReadSupportsAlt(dv_call, r, alt_alleles)));
+    DumpPod(b, int32_t(r.alignment().cigar_size()));
+    for (const auto& c : r.alignment().cigar()) { DumpPod(b, uint8_t(c.operation())); DumpPod(b, int32_t(c.operation_length())); }
+    DumpPod(b, int32_t(r.aligned_sequence().size())); DumpBytes(b, r.aligned_sequence());
+    DumpPod(b, int32_t(r.aligned_quality().size()));
+    for (auto q : r.aligned_quality()) DumpPod(b, uint8_t(q));
   }
-  for (const auto& row : rows)
-    for (const auto& ch : row->channel_data) fwrite(ch.data(), 1, ch.size(), f);
+  const size_t b1 = b->size();
+  if (fused_sink_ == nullptr || fused_with_rows_ || f != nullptr) {
+    for (const auto& row : rows)
+      for (const auto& ch : row->channel_data) b->append(reinterpret_cast<const char*>(ch.data()), ch.size());
+  }
+  if (f != nullptr) fwrite(b->data() + b0, 1, b->size() - b0, f);
+  if (fused_sink_ != nullptr && !fused_with_rows_) b->resize(b1);  // rows were only for the capture file
 }
 
 std::vector<std::unique_ptr<ImageRow>>
@@ -309,7 +322,9 @@ PileupImageEncoderNative::BuildPileupForOneSample(
   // Reference band at the top of the image.
   // TODO Calculate the reference band once and reuse it for each
   // row.
-  if (PileupFastPath() && options_.reference_band_height() > 0) {
+  if (fused_skip_rows_) {
+    // Fused hand-off: no rows on the CPU (the GPU builds the image).
+  } else if (PileupFastPath() && options_.reference_band_height() > 0) {
     // The reference rows depend only on ref_bases: encode one, copy the rest.
     rows.push_back(EncodeReference(ref_bases));
     for (int i = 1; i < options_.reference_band_height(); i++) {
@@ -338,6 +353,13 @@ PileupImageEncoderNative::BuildPileupForOneSample(
         DownsampleReadIndices(reads, max_reads, gen));
   } else {
     sampled_indices = DownsampleReadIndices(reads, max_reads, gen);
+  }
+
+  if (fused_skip_rows_) {
+    DumpPileupCall(dv_call, ref_bases, reads, image_start_pos, alt_alleles,
+                   max_reads, sampled_indices, alignment_positions,
+                   channels_enum_to_blank, pileup_height, rows);
+    return rows;
   }
 
   // We add a row for each read in order, down-sampling if the number of
@@ -409,7 +431,7 @@ PileupImageEncoderNative::BuildPileupForOneSample(
 
   DumpPileupCall(dv_call, ref_bases, reads, image_start_pos, alt_alleles,
                  max_reads, sampled_indices, alignment_positions,
-                 channels_enum_to_blank, rows);
+                 channels_enum_to_blank, pileup_height, rows);
   return rows;
 }
 
