@@ -342,6 +342,13 @@ int32_t GetMethylationLevel(const Read& read, int offset) {
 }
 
 namespace {
+// DV_AC_FUSE=0: Add() pushes every aligned base for AddReadAllelesFast, as
+// before. Otherwise a reference base that is not its CIGAR op's last base,
+// on a read without base modifications and with methylation options off, is
+// counted in place when AddReadAllelesFast would only bump its reference
+// count (non-candidate position) or do nothing (low quality) (#10).
+const bool kNoAcFuse = std::getenv("DV_AC_FUSE") != nullptr &&
+                       std::string(std::getenv("DV_AC_FUSE")) == "0";
 const bool kNoCountPool = std::getenv("DV_COUNT_POOL") != nullptr &&
                           std::string(std::getenv("DV_COUNT_POOL")) == "0";
 }  // namespace
@@ -365,6 +372,13 @@ void AlleleCounter::Init() {
   // Set candidate positions relative to the interval.
   for (auto& candidate_position : candidate_positions_) {
     candidate_position -= interval_.start();
+  }
+  cand_sorted_ = std::is_sorted(candidate_positions_.begin(),
+                                candidate_positions_.end());
+  if (cand_sorted_) {
+    cand_mark_.assign(len, 0);
+    for (int p : candidate_positions_)
+      if (p >= 0 && p < len) cand_mark_[p] = 1;
   }
   auto full_interval_offset = interval_.start() - reads_interval_.start();
   // If interval_ starts before reads_interval_ start then we don't need to
@@ -660,9 +674,7 @@ void AlleleCounter::AddReadAllelesFast(const Read& read,
     if (a.type != AlleleType::REFERENCE ||
         (options_.enable_methylation_aware_phasing() ||
          options_.enable_methylation_calling()) ||
-        (options_.track_ref_reads() &&
-         std::binary_search(candidate_positions_.begin(),
-                            candidate_positions_.end(), a.position))) {
+        (options_.track_ref_reads() && IsCandidatePosition(a.position))) {
       if (light_) {
         AddLight(a.position, read, a.type, a.is_low_quality,
                  a.indel >= 0 ? absl::string_view(indels[a.indel].bases())
@@ -1106,6 +1118,15 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
   const bool legacy = options_.keep_legacy_behavior();
   const int min_bq = options_.read_requirements().min_base_quality();
 
+  const bool fuse = !kNoAcFuse && !has_mods &&
+                    !options_.enable_methylation_aware_phasing() &&
+                    !options_.enable_methylation_calling();
+  const bool track = options_.track_ref_reads();
+  const char* const rs = read_seq.data();
+  const char* const refb = ref_bases_.data();
+  const int64_t ref_len = ReadsIntervalLength();
+  const int64_t ivl_len = IntervalLength();
+
   auto add_indel = [&](ReadAllele&& ra) {
     FastAllele f{ra.position(), ra.type(), ra.is_low_quality(),
                  ra.mapping_quality(), ra.avg_base_quality(),
@@ -1122,6 +1143,104 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
       case CigarUnit::ALIGNMENT_MATCH:
       case CigarUnit::SEQUENCE_MATCH:
       case CigarUnit::SEQUENCE_MISMATCH:
+        if (fuse) {
+          // Same records as the loop below, except that reference bases
+          // other than the op's last (which may share its position with a
+          // following indel, and so be dropped by AddReadAllelesFast) are
+          // resolved here when they would not produce an allele. Everything
+          // the loop reads is copied into locals first, so the compiler can
+          // keep it in registers across the count stores.
+          const int ro = ref_interval_offset, bo = read_offset, io = interval_offset;
+          const int64_t rlen = ref_len, ilen = ivl_len;
+          const char* const seq = rs;
+          const char* const refp = refb;
+          const char* const qp = quals.data();  // aligned_quality is bytes here
+          const int nq = quals.size();
+          const int mbq = min_bq;
+          const bool leg = legacy, trk = track;
+          const char* const restrict_p =
+              restrict_positions_ ? restrict_positions_->data() : nullptr;
+          const char* const cmark = cand_sorted_ ? cand_mark_.data() : nullptr;
+          const int ncmark = cand_mark_.size();
+          AlleleCount* const cnt = counts_.data();
+          auto general = [&](int a, int b) {
+          for (int i = a; i < b; ++i) {
+            const int ref_offset = ro + i;
+            const int base_offset = bo + i;
+            if (ref_offset < 0 || ref_offset >= rlen) continue;
+            CHECK_LE(base_offset + 1, nq);
+            const int q = qp[base_offset];
+            if (q < mbq && leg) continue;
+            const char c = seq[base_offset];
+            if (!nucleus::IsCanonicalBase(c)) continue;
+            const bool is_low_quality = !leg && q < mbq;
+            const int pos = io + i;
+            const bool is_ref = refp[ref_offset] == c;
+            if (is_ref && i + 1 < op_len) {
+              if (pos < 0 || pos >= ilen) continue;
+              if (restrict_p && !restrict_p[pos]) continue;
+              const bool cand =
+                  trk && (cmark ? (pos < ncmark && cmark[pos])
+                                : IsCandidatePosition(pos));
+              if (!cand) {
+                if (!is_low_quality) {
+                  AlleleCount& ac = cnt[pos];
+                  ac.set_ref_supporting_read_count(
+                      ac.ref_supporting_read_count() + 1);
+                }
+                continue;
+              }
+            }
+            to_add.push_back(FastAllele{
+                pos, is_ref ? AlleleType::REFERENCE : AlleleType::SUBSTITUTION,
+                is_low_quality, mapq, static_cast<uint8_t>(q), reverse, false,
+                0, c, -1});
+          }
+          };
+          // Fast range: ref and interval offsets valid, not the op's last base,
+          // no position restriction and no candidate position in range. There
+          // a canonical reference base only adds its count (+0 when low
+          // quality: the same value), and anything else is pushed as before.
+          int lo = std::max(0, std::max(-ro, -io));
+          int hi = static_cast<int>(std::min<int64_t>(
+              op_len - 1, std::min<int64_t>(rlen - ro, ilen - io)));
+          bool fast = lo < hi && restrict_p == nullptr &&
+                      (!trk || cand_sorted_);
+          if (fast && trk) {
+            auto it = std::lower_bound(candidate_positions_.begin(),
+                                       candidate_positions_.end(), io + lo);
+            fast = it == candidate_positions_.end() || *it >= io + hi;
+          }
+          if (!fast) {
+            general(0, op_len);
+          } else {
+            general(0, lo);
+            if (bo + hi > nq) {
+              general(lo, hi);  // let the general loop CHECK as before
+            } else {
+              for (int i = lo; i < hi; ++i) {
+                const int q = qp[bo + i];
+                if (q < mbq && leg) continue;
+                const char c = seq[bo + i];
+                if (!nucleus::IsCanonicalBase(c)) continue;
+                if (refp[ro + i] == c) {
+                  AlleleCount& ac = cnt[io + i];
+                  ac.set_ref_supporting_read_count(
+                      ac.ref_supporting_read_count() + (q >= mbq ? 1 : 0));
+                } else {
+                  to_add.push_back(FastAllele{
+                      io + i, AlleleType::SUBSTITUTION, !leg && q < mbq, mapq,
+                      static_cast<uint8_t>(q), reverse, false, 0, c, -1});
+                }
+              }
+            }
+            general(hi, op_len);
+          }
+          read_offset += op_len;
+          ref_interval_offset += op_len;
+          interval_offset += op_len;
+          break;
+        }
         for (int i = 0; i < op_len; ++i) {
           const int ref_offset = ref_interval_offset + i;
           const int base_offset = read_offset + i;

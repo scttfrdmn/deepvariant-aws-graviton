@@ -545,6 +545,16 @@ class AlleleCounter {
   // positions found in this vector. This functionality is optional and
   // governed by track_ref_reads flag.
   std::vector<int> candidate_positions_;
+  // candidate_positions_ as a bitmap over the interval (after Init), used when
+  // the vector is sorted so that membership equals std::binary_search (#10).
+  std::vector<char> cand_mark_;
+  bool cand_sorted_ = false;
+  bool IsCandidatePosition(int pos) const {
+    return cand_sorted_ ? (pos >= 0 && pos < static_cast<int>(cand_mark_.size()) &&
+                           cand_mark_[pos])
+                        : std::binary_search(candidate_positions_.begin(),
+                                             candidate_positions_.end(), pos);
+  }
 
   // The options that are controlling how we count reads.
   const AlleleCounterOptions options_;
