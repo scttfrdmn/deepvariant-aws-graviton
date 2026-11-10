@@ -38,6 +38,7 @@ from typing import Dict, Sequence
 from deepvariant import variant_caller
 from deepvariant.protos import deepvariant_pb2
 from deepvariant.python import allelecounter
+from deepvariant.small_model import make_small_model_examples
 
 
 class VerySensitiveCaller(variant_caller.VariantCaller):
@@ -55,6 +56,17 @@ class VerySensitiveCaller(variant_caller.VariantCaller):
       allele_counters: Dict[str, allelecounter.AlleleCounter],
       sample_name: str,
   ) -> Sequence[deepvariant_pb2.DeepVariantCall]:
+    window = getattr(self, 'small_model_sums_window', None)
+    if window is not None:
+      # The same candidates, plus the read sums the small model's features use,
+      # computed in C++ from the C++ calls (deepvariant-aws-graviton#10).
+      candidates, sums = (
+          self.cpp_variant_caller.calls_from_allele_counts_with_small_model_sums(
+              allele_counters, sample_name, window
+          )
+      )
+      make_small_model_examples.register_cpp_sums(candidates, sums)
+      return candidates
     return self.cpp_variant_caller.calls_from_allele_counts(
         allele_counters, sample_name
     )

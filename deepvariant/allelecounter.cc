@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <string>
 #include <utility>
+#include <thread>
 #include <vector>
 
 #include "deepvariant/channels/base_methylation_channel.h"
@@ -357,7 +358,18 @@ const bool kNoCountPool = std::getenv("DV_COUNT_POOL") != nullptr &&
                           std::string(std::getenv("DV_COUNT_POOL")) == "0";
 }  // namespace
 
+// As DeBruijnGraph's Scratch(): the first thread gets a plain static, others a
+// thread_local, so the common single-threaded call avoids __tls_get_addr's slow
+// path in a dlopen'ed module (deepvariant-aws-graviton#10).
 std::vector<std::vector<AlleleCount>>& AlleleCounter::CountPool() {
+  static const std::thread::id first_thread = std::this_thread::get_id();
+  // DV_TLS_SCRATCH=1: always the thread_local (the previous behaviour).
+  static const bool tls_only = std::getenv("DV_TLS_SCRATCH") != nullptr &&
+                               std::getenv("DV_TLS_SCRATCH")[0] == '1';
+  if (!tls_only && std::this_thread::get_id() == first_thread) {
+    static std::vector<std::vector<AlleleCount>> shared;
+    return shared;
+  }
   thread_local std::vector<std::vector<AlleleCount>> pool;
   return pool;
 }

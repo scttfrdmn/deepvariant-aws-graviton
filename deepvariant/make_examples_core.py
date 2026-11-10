@@ -1675,6 +1675,22 @@ class RegionProcessor:
           sample.options.variant_caller_options,
           sample.options.proposed_variants_filename,
       )
+      # The small model's one-sample features from read sums the C++ caller
+      # computes with the candidates (deepvariant-aws-graviton#10). Not with the
+      # allele_frequency channel, which edits candidates after they are called.
+      if (
+          os.environ.get('DV_SM_CPP_SUMS') != '0'
+          and self.options.call_small_model_examples
+          and len(self.samples) == 1
+          and self.small_model_example_factory._fast_plan is not None  # pylint: disable=protected-access
+          and 'allele_frequency' not in self.options.pic_options.channels
+          and isinstance(
+              sample.variant_caller, very_sensitive_caller.VerySensitiveCaller
+          )
+      ):
+        sample.variant_caller.small_model_sums_window = (
+            self.options.small_model_vaf_context_window_size
+        )
       if (
           self.options.call_small_model_examples
           and sample.options.small_model_path

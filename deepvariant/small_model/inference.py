@@ -53,11 +53,34 @@ GENOTYPE_BY_ENCODING = {
 
 def _dense_stack_forward(stack, batch):
   """Keras' eager Sequential-of-Dense forward pass, op for op."""
+  if _RAW_OPS:
+    return _dense_stack_forward_raw(stack, batch)
   x = tf.cast(tf.convert_to_tensor(batch), tf.float32)
   for kernel, bias, activation in stack:
     x = tf.matmul(x, kernel)
     x = tf.nn.bias_add(x, bias)
     x = tf.nn.relu(x) if activation == 'relu' else tf.nn.softmax(x, axis=-1)
+  return x
+
+
+# The same eager ops without the Python dispatch layers around them: for rank-2
+# float32 inputs tf.cast, tf.matmul, tf.nn.bias_add, tf.nn.relu and
+# tf.nn.softmax(axis=-1) each end in exactly these gen_* calls (TF 2.13), so the
+# kernels and their inputs are unchanged (deepvariant-aws-graviton#10).
+# DV_SMALL_MODEL_RAWOPS=0 keeps the public API calls.
+_RAW_OPS = os.environ.get('DV_SMALL_MODEL_RAWOPS') != '0'
+from tensorflow.python.ops import gen_math_ops as _gen_math_ops  # pylint: disable=g-direct-tensorflow-import,g-import-not-at-top
+from tensorflow.python.ops import gen_nn_ops as _gen_nn_ops  # pylint: disable=g-direct-tensorflow-import,g-import-not-at-top
+
+
+def _dense_stack_forward_raw(stack, batch):
+  x = tf.convert_to_tensor(batch)
+  if x.dtype != tf.float32:
+    x = _gen_math_ops.cast(x, tf.float32, Truncate=False)
+  for kernel, bias, activation in stack:
+    x = _gen_math_ops.mat_mul(x, kernel, transpose_a=False, transpose_b=False)
+    x = _gen_nn_ops.bias_add(x, bias, data_format='NHWC')
+    x = _gen_nn_ops.relu(x) if activation == 'relu' else _gen_nn_ops.softmax(x)
   return x
 
 class SmallModelVariantCaller:
