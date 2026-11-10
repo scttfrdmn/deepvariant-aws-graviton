@@ -125,6 +125,17 @@ FAKE_CANDIDATE = deepvariant_pb2.DeepVariantCall(
 )
 DEFAULT_ALT_ALLELE_INDICES = (0,)
 
+# Read sums for the current region's candidates, from the C++ caller
+# (calls_from_allele_counts_with_small_model_sums), keyed by id() with the
+# candidate kept alongside so a recycled id can never match
+# (deepvariant-aws-graviton#10).
+_CPP_SUMS = {}
+
+
+def register_cpp_sums(candidates, sums) -> None:
+  global _CPP_SUMS
+  _CPP_SUMS = {id(c): (c, s) for c, s in zip(candidates, sums)}
+
 
 def _mean_for_attribute(
     read_infos: Sequence[deepvariant_pb2.DeepVariantCall.ReadSupport],
@@ -595,12 +606,98 @@ class SmallModelExampleFactory:
       return None
     return plan
 
+  def _encode_from_sums(self, candidate, alt_allele_indices, sums):
+    """The fast path's values from the C++ read sums; None to fall back."""
+    variant = candidate.variant
+    n_alts = len(variant.alternate_bases)
+    if len(sums) < 4 * (1 + n_alts) + 1 or any(
+        sums[4 + 4 * i] < 0 for i in range(n_alts)
+    ):
+      return None  # a missing allele: the Python path raises as before
+    n_ref, rmq, rbq, rrs = sums[0], sums[1], sums[2], sums[3]
+    n_alt = amq = abq = ars = 0
+    for i in alt_allele_indices:
+      j = 4 + 4 * i
+      n_alt += sums[j]
+      amq += sums[j + 1]
+      abq += sums[j + 2]
+      ars += sums[j + 3]
+    total = sums[4 * (1 + n_alts)]
+    vaf0 = 4 * (1 + n_alts) + 1 + self.vaf_context_window_size // 2
+    exclude_alleles = None
+    out = []
+    for kind, key in self._fast_plan:
+      if kind == 'vaf':
+        out.append(sums[vaf0 + key])
+      elif kind == 'variant':
+        if exclude_alleles is None:
+          exclude_alleles = get_exclude_alleles(candidate, alt_allele_indices)
+        out.append(self._variant_feature(
+            key, variant, alt_allele_indices, exclude_alleles))
+      elif key == BaseFeature.NUM_READS_SUPPORTS_REF:
+        out.append(n_ref)
+      elif key == BaseFeature.NUM_READS_SUPPORTS_ALT:
+        out.append(n_alt)
+      elif key == BaseFeature.ALT_INDICES_DEPTH:
+        out.append(n_ref + n_alt)
+      elif key == BaseFeature.TOTAL_DEPTH:
+        out.append(total)
+      elif key == BaseFeature.VARIANT_ALLELE_FREQUENCY:
+        out.append(100 * n_alt // total if total else 0)
+      elif key == BaseFeature.ALT_INDICES_VARIANT_ALLELE_FREQUENCY:
+        dp = n_ref + n_alt
+        out.append(100 * n_alt // dp if dp else 0)
+      elif key == BaseFeature.REF_MAPPING_QUALITY:
+        out.append(rmq // n_ref if n_ref else 0)
+      elif key == BaseFeature.ALT_MAPPING_QUALITY:
+        out.append(amq // n_alt if n_alt else 0)
+      elif key == BaseFeature.REF_BASE_QUALITY:
+        out.append(rbq // n_ref if n_ref else 0)
+      elif key == BaseFeature.ALT_BASE_QUALITY:
+        out.append(abq // n_alt if n_alt else 0)
+      elif key == BaseFeature.REF_REVERSE_STRAND_RATIO:
+        out.append(100 * rrs // n_ref if n_ref else 0)
+      elif key == BaseFeature.ALT_REVERSE_STRAND_RATIO:
+        out.append(100 * ars // n_alt if n_alt else 0)
+      else:
+        raise ValueError(f'{key.value} does not map to a callable.')
+    return out
+
+  def _variant_feature(self, key, variant, alt_allele_indices, exclude_alleles):
+    alternate_bases = variant.alternate_bases
+    if key == VariantFeature.IS_SNP:
+      return int(variant_utils.is_snp(variant, exclude_alleles))
+    elif key == VariantFeature.IS_INSERTION:
+      return int(variant_utils.variant_is_insertion(variant, exclude_alleles))
+    elif key == VariantFeature.IS_DELETION:
+      return int(variant_utils.variant_is_deletion(variant, exclude_alleles))
+    elif key == VariantFeature.INSERTION_LENGTH:
+      return max(0, max(
+          len(alternate_bases[i]) - len(variant.reference_bases)
+          for i in alt_allele_indices
+      ))
+    elif key == VariantFeature.DELETION_LENGTH:
+      return max(0, max(
+          len(variant.reference_bases) - len(alternate_bases[i])
+          for i in alt_allele_indices
+      ))
+    elif key == VariantFeature.IS_MULTIALLELIC:
+      return int(variant_utils.is_multiallelic(variant))
+    elif key == VariantFeature.IS_MULTIPLE_ALT_ALLELES:
+      return int(len(alt_allele_indices) > 1)
+    raise ValueError(f'{key.value} does not map to a callable.')
+
   def _encode_model_features_fast(
       self,
       candidate: deepvariant_pb2.DeepVariantCall,
       alt_allele_indices: tuple[int, ...],
   ) -> list[int]:
     """_encode_model_features for one sample, no haplotypes, same values."""
+    entry = _CPP_SUMS.get(id(candidate))
+    if entry is not None and entry[0] is candidate:
+      out = self._encode_from_sums(candidate, alt_allele_indices, entry[1])
+      if out is not None:
+        return out
     variant = candidate.variant
     alternate_bases = variant.alternate_bases
     allele_support_ext = candidate.allele_support_ext
