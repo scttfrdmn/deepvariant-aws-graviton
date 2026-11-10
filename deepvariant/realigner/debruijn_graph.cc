@@ -48,10 +48,7 @@
 #include <vector>
 
 #include "deepvariant/protos/realigner.pb.h"
-#include <utility>
-
 #include "absl/container/btree_set.h"
-#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_set.h"
 #include "absl/log/check.h"
@@ -289,8 +286,6 @@ namespace {
 // case) is -1, and k-mers containing one are keyed by their string, so the
 // vertex identity is the k-mer string exactly as in the boost version.
 bool DbgEnv(const char* name);
-// DV_DBG_NO128=1: k-mers of 32 < k <= 64 keyed by string, as before (#10).
-const bool kDbgUse128 = !DbgEnv("DV_DBG_NO128");
 
 struct BaseCodes {
   int8_t c[256];
@@ -310,14 +305,6 @@ struct FlatGraph {
   std::vector<E> edges;
   absl::flat_hash_map<absl::string_view, int> index;      // k > 32 or non-ACGT
   absl::flat_hash_map<uint64_t, int> index64;             // k <= 32, ACGT
-  // 32 < k <= 64, ACGT (#10): two 64-bit words of the 2-bit code, so these
-  // k-mers are hashed as integers too; the vertex identity is unchanged.
-  using Key128 = std::pair<uint64_t, uint64_t>;
-  absl::flat_hash_map<Key128, int> index128;
-  unsigned __int128 mask128 = 0;
-  static Key128 Split(unsigned __int128 v) {
-    return {static_cast<uint64_t>(v >> 64), static_cast<uint64_t>(v)};
-  }
   std::vector<uint8_t> color;
   std::vector<std::pair<int, int>> stack;
   // Closed-walk check (deepvariant-aws-graviton#10): seen[v] is the id of the
@@ -336,12 +323,7 @@ struct FlatGraph {
     seen.clear(); segment = 0;
     index.clear();
     index64.clear();
-    index128.clear();
-    mask128 = k >= 64 ? ~static_cast<unsigned __int128>(0)
-                      : ((static_cast<unsigned __int128>(1) << (2 * k)) - 1);
-    if (k <= 32) index64.reserve(hint);
-    else if (k <= 64 && kDbgUse128) index128.reserve(hint);
-    else index.reserve(hint);
+    if (k <= 32) index64.reserve(hint); else index.reserve(hint);
   }
   int NewVertex(absl::string_view km) {
     const int v = static_cast<int>(kmer.size());
@@ -362,11 +344,6 @@ struct FlatGraph {
     if (inserted) it->second = NewVertex(km);
     return it->second;
   }
-  int Ensure128(unsigned __int128 key, absl::string_view km) {
-    auto [it, inserted] = index128.try_emplace(Split(key), 0);
-    if (inserted) it->second = NewVertex(km);
-    return it->second;
-  }
   // Vertex for one k-mer (source/sink lookup); -1 if absent.
   int Find(absl::string_view km) const {
     if (k <= 32) {
@@ -378,15 +355,6 @@ struct FlatGraph {
         key = (key << 2) | c;
       }
       if (acgt) { auto it = index64.find(key); return it == index64.end() ? -1 : it->second; }
-    } else if (k <= 64 && kDbgUse128) {
-      unsigned __int128 key = 0;
-      bool acgt = true;
-      for (char ch : km) {
-        const int8_t c = kCodes.c[static_cast<uint8_t>(ch)];
-        if (c < 0) { acgt = false; break; }
-        key = (key << 2) | static_cast<unsigned __int128>(c);
-      }
-      if (acgt) { auto it = index128.find(Split(key)); return it == index128.end() ? -1 : it->second; }
     }
     auto it = index.find(km);
     return it == index.end() ? -1 : it->second;
@@ -420,30 +388,6 @@ struct FlatGraph {
       seen[v] = seg;
       return false;
     };
-    if (k > 32 && k <= 64 && kDbgUse128) {
-      unsigned __int128 key = 0;
-      int bad = start - 1;
-      for (int j = start; j < start + k; ++j) {
-        const int8_t c = kCodes.c[static_cast<uint8_t>(bases[j])];
-        if (c < 0) { bad = j; key = key << 2; } else { key = (key << 2) | static_cast<unsigned __int128>(c); }
-      }
-      key &= mask128;
-      auto vertex_at = [&](int i) {
-        return bad < i ? Ensure128(key, bases.substr(i, k)) : EnsureStr(bases.substr(i, k));
-      };
-      int prev = vertex_at(start);
-      bool closed = visit(prev);
-      for (int i = start + 1; i <= end; ++i) {
-        const int j = i + k - 1;
-        const int8_t c = kCodes.c[static_cast<uint8_t>(bases[j])];
-        if (c < 0) { bad = j; key = (key << 2) & mask128; } else { key = ((key << 2) | static_cast<unsigned __int128>(c)) & mask128; }
-        const int cur = vertex_at(i);
-        AddEdge(prev, cur, is_ref);
-        closed |= visit(cur);
-        prev = cur;
-      }
-      return closed;
-    }
     if (k > 32) {
       int prev = EnsureStr(bases.substr(start, k));
       bool closed = visit(prev);
@@ -508,7 +452,6 @@ struct FlatScratch {
   std::vector<const Read*> read_ptrs;
   absl::flat_hash_set<absl::string_view> ref_kmers;
   absl::flat_hash_set<uint64_t> ref_kmers64;
-  absl::flat_hash_set<std::pair<uint64_t, uint64_t>> ref_kmers128;
   std::vector<int> in_head, in_next, in_from, rstack;
   std::vector<uint8_t> fwd, rev;
   std::vector<int> pnode_v, pnode_parent, queue, terminated;
@@ -621,21 +564,6 @@ bool FlatBuild(absl::string_view ref,
         const int i = j - k + 1;
         if (i < 0) continue;
         if (bad < i) { if (!sc.ref_kmers64.insert(key).second) has_cycle = true; }
-        else if (!sc.ref_kmers.insert(ref.substr(i, k)).second) has_cycle = true;
-      }
-    } else if (k <= 64 && kDbgUse128) {
-      sc.ref_kmers128.clear();
-      sc.ref_kmers128.reserve(n_kmers);
-      const unsigned __int128 mask = k >= 64 ? ~static_cast<unsigned __int128>(0)
-                                             : ((static_cast<unsigned __int128>(1) << (2 * k)) - 1);
-      unsigned __int128 key = 0;
-      int bad = -1;
-      for (int j = 0; j < static_cast<int>(ref.size()) && !has_cycle; ++j) {
-        const int8_t c = kCodes.c[static_cast<uint8_t>(ref[j])];
-        if (c < 0) { bad = j; key = (key << 2) & mask; } else { key = ((key << 2) | static_cast<unsigned __int128>(c)) & mask; }
-        const int i = j - k + 1;
-        if (i < 0) continue;
-        if (bad < i) { if (!sc.ref_kmers128.insert(FlatGraph::Split(key)).second) has_cycle = true; }
         else if (!sc.ref_kmers.insert(ref.substr(i, k)).second) has_cycle = true;
       }
     } else {
