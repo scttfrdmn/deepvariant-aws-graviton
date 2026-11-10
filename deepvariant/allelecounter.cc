@@ -373,8 +373,8 @@ void AlleleCounter::Init() {
   for (auto& candidate_position : candidate_positions_) {
     candidate_position -= interval_.start();
   }
-  cand_sorted_ = std::is_sorted(candidate_positions_.begin(),
-                                candidate_positions_.end());
+  cand_sorted_ = !kNoAcFuse && std::is_sorted(candidate_positions_.begin(),
+                                              candidate_positions_.end());
   if (cand_sorted_) {
     cand_mark_.assign(len, 0);
     for (int p : candidate_positions_)
@@ -1107,8 +1107,16 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
   const LinearAlignment& aln = read.alignment();
   // Allele records in the order Add() always produced them; single-base
   // alleles carry their base inline, indels index into `indels`.
-  std::vector<FastAllele> to_add;
-  std::vector<ReadAllele> indels;
+  // Per-thread buffers reused across reads (capacity kept, contents cleared):
+  // two allocations fewer per read (#10).
+  static thread_local std::vector<FastAllele> to_add_buf;
+  static thread_local std::vector<ReadAllele> indels_buf;
+  std::vector<FastAllele> to_add_local;
+  std::vector<ReadAllele> indels_local;
+  std::vector<FastAllele>& to_add = kNoAcFuse ? to_add_local : to_add_buf;
+  std::vector<ReadAllele>& indels = kNoAcFuse ? indels_local : indels_buf;
+  to_add.clear();
+  indels.clear();
   to_add.reserve(read.aligned_quality().size());
   int read_offset = 0;
   int ref_interval_offset =
@@ -1232,19 +1240,30 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
             if (bo + hi > nq) {
               general(lo, hi);  // let the general loop CHECK as before
             } else {
+              // Fresh locals (the lambdas above capture by reference, which
+              // would keep their variables in memory).
+              const char* const fs = seq + bo;
+              const char* const fr = refp + ro;
+              const char* const fq = qp + bo;
+              AlleleCount* const fc = cnt + io;
+              const int fmbq = mbq, fio = io;
+              const bool fleg = leg;
               for (int i = lo; i < hi; ++i) {
-                const int q = qp[bo + i];
-                if (q < mbq && leg) continue;
-                const char c = seq[bo + i];
+                const int q = fq[i];
+                if (q < fmbq && fleg) continue;
+                const char c = fs[i];
                 if (!nucleus::IsCanonicalBase(c)) continue;
-                if (refp[ro + i] == c) {
-                  AlleleCount& ac = cnt[io + i];
-                  ac.set_ref_supporting_read_count(
-                      ac.ref_supporting_read_count() + (q >= mbq ? 1 : 0));
+                if (fr[i] == c) {
+                  if (q >= fmbq) {
+                    AlleleCount& ac = fc[i];
+                    ac.set_ref_supporting_read_count(
+                        ac.ref_supporting_read_count() + 1);
+                  }
                 } else {
                   to_add.push_back(FastAllele{
-                      io + i, AlleleType::SUBSTITUTION, !leg && q < mbq, mapq,
-                      static_cast<uint8_t>(q), reverse, false, 0, c, -1});
+                      fio + i, AlleleType::SUBSTITUTION, !fleg && q < fmbq,
+                      mapq, static_cast<uint8_t>(q), reverse, false, 0, c,
+                      -1});
                 }
               }
             }
