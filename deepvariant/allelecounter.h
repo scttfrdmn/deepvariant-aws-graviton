@@ -583,6 +583,8 @@ class AlleleCounter {
   bool light_ = false;
   // DeriveTrackedFrom: when set, Add() changes only positions marked here.
   const std::vector<char>* restrict_positions_ = nullptr;
+  // The marked positions of restrict_positions_, sorted and unique (#10).
+  const std::vector<int>* restrict_list_ = nullptr;
   std::vector<LightRec> light_recs_;
   std::string light_bases_;
   absl::flat_hash_map<std::string, int> light_keys_;

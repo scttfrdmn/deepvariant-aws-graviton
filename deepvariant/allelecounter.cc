@@ -744,6 +744,11 @@ bool AlleleCounter::DeriveTrackedFrom(
   std::vector<int> cand(candidate_positions_.begin(), candidate_positions_.end());
   std::sort(cand.begin(), cand.end());
   restrict_positions_ = &mark;
+  // Marked positions in order, for Add()'s restricted match loop.
+  std::vector<int> marked;
+  for (size_t p = 0; p < mark.size(); ++p)
+    if (mark[p]) marked.push_back(static_cast<int>(p));
+  restrict_list_ = &marked;
   for (const auto& r : reads) {
     if (!nucleus::ReadOverlapsRegion(*r.p_, region)) continue;
     const int64_t s0 = r.p_->alignment().position().position() - interval_.start() - 2;
@@ -753,6 +758,7 @@ bool AlleleCounter::DeriveTrackedFrom(
     Add(*r.p_, sample, nullptr);
   }
   restrict_positions_ = nullptr;
+  restrict_list_ = nullptr;
   n_reads_counted_ = src->n_reads_counted_;
   ReturnToCountPool(&src->counts_);
   src->counts_.clear();
@@ -1211,7 +1217,15 @@ void AlleleCounter::Add(const nucleus::genomics::v1::Read& read,
                                        candidate_positions_.end(), io + lo);
             fast = it == candidate_positions_.end() || *it >= io + hi;
           }
-          if (!fast) {
+          if (restrict_p && restrict_list_ && bo + op_len <= nq) {
+            // Only marked positions can change (AddReadAllelesFast drops the
+            // rest, and an unmarked entry never shares a position with a
+            // marked one), so visit just the marked positions in this op.
+            auto it = std::lower_bound(restrict_list_->begin(),
+                                       restrict_list_->end(), io);
+            for (; it != restrict_list_->end() && *it < io + op_len; ++it)
+              general(*it - io, *it - io + 1);
+          } else if (!fast) {
             general(0, op_len);
           } else {
             general(0, lo);
