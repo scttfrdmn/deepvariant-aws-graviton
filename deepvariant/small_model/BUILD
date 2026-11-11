@@ -44,6 +44,7 @@ py_library(
     srcs = ["inference.py"],
     deps = [
         ":keras_config",
+        "//deepvariant/python:small_model_x86order",
         ":make_small_model_examples",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//third_party/nucleus/util:genomics_math",

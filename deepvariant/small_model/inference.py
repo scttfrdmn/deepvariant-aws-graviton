@@ -83,6 +83,18 @@ def _dense_stack_forward_raw(stack, batch):
     x = _gen_nn_ops.relu(x) if activation == 'relu' else _gen_nn_ops.softmax(x)
   return x
 
+# DV_SMALL_MODEL_X86_ORDER=1: the dense stack runs in a C++ kernel that
+# reproduces, bit for bit, what stock DeepVariant computes on x86-64 (TF 2.13.1
+# pip wheel, oneDNN, AVX-512): one FMA chain per output over k (two chains of
+# 375 summed for K=750 when the batch has two or more rows), separate bias add,
+# relu, and oneDNN's softmax (its exp polynomial, (e0+e2)+e1, times 1/s, FTZ).
+# For arm64, whose TF kernels round differently (deepvariant-aws-graviton#1).
+# Off (default): unchanged.
+_X86_ORDER = os.environ.get('DV_SMALL_MODEL_X86_ORDER') == '1'
+if _X86_ORDER:
+  from deepvariant.python import small_model_x86order as _x86order  # pylint: disable=g-import-not-at-top
+
+
 class SmallModelVariantCaller:
   """Class responsible for calling variants on candidate examples.
 
@@ -172,8 +184,16 @@ class SmallModelVariantCaller:
     (deepvariant-aws-graviton)
     """
     predictions, eager = [], []
+    weights = self._x86order_weights() if _X86_ORDER else None
     for i in range(0, len(examples), self.batch_size):
       batch = examples[i : i + self.batch_size]
+      if weights is not None:
+        # Same values as either TF path below on x86; tagged as that path
+        # would tag them (partial batches eager, full ones predict_on_batch).
+        rows = list(_x86order.forward(np.asarray(batch, dtype=np.float32), *weights))
+        predictions.extend(rows)
+        eager.extend([len(batch) < self.batch_size] * len(rows))
+        continue
       if len(batch) < self.batch_size:
         stack = self._dense_stack()
         if stack is not None:
@@ -195,6 +215,18 @@ class SmallModelVariantCaller:
         predictions.extend(rows)
         eager.extend([False] * len(rows))
     return predictions, eager
+
+  def _x86order_weights(self):
+    """(w1, b1, w2, b2, w3, b3) as float32 numpy for the x86-order kernel."""
+    if not hasattr(self, '_x86order_cache'):
+      stack = self._dense_stack()
+      if stack is None or len(stack) != 3:
+        raise ValueError('DV_SMALL_MODEL_X86_ORDER=1 needs the 3-layer Dense small model')
+      w = []
+      for kernel, bias, _ in stack:
+        w += [np.ascontiguousarray(kernel.numpy(), np.float32), np.ascontiguousarray(bias.numpy(), np.float32)]
+      self._x86order_cache = tuple(w)
+    return self._x86order_cache
 
   def _dense_stack(self):
     """The classifier as (kernel, bias, activation) per Dense layer, or None.

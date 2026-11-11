@@ -65,6 +65,7 @@ cc_library(
         "//deepvariant/python:methylation_aware_phasing_cclib",
         "//deepvariant/python:pileup_image_native_cclib",
         "//deepvariant/python:postprocess_variants_cclib",
+        "//deepvariant/python:small_model_x86order_cclib",
         "//deepvariant/python:variant_calling_cclib",
         "//deepvariant/python:variant_calling_multisample_cclib",
         "//deepvariant/realigner/python:debruijn_graph_cclib",

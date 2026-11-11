@@ -190,6 +190,16 @@ pybind_library(
 )
 
 pybind_extension(
+    name = "small_model_x86order",
+    srcs = ["small_model_x86order_pybind.cc"],
+)
+
+pybind_library(
+    name = "small_model_x86order_cclib",
+    srcs = ["small_model_x86order_pybind.cc"],
+)
+
+pybind_extension(
     name = "pileup_image_native",
     srcs = ["pileup_image_native_pybind.cc"],
     deps = [
