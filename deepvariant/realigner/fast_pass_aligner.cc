@@ -31,7 +31,9 @@
 
 #include "deepvariant/realigner/fast_pass_aligner.h"
 
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -368,6 +370,7 @@ void FastPassAligner::FastAlignReadsToHaplotype(
 
 // Mismatches between equal-length strings, where a position with 'N' on
 // either side is not a mismatch; AVX-512BW, 64 bytes per step (#9).
+#if defined(__x86_64__)
 __attribute__((target("avx512bw"))) static int CountMismatchesAvx512(
     const char* a, const char* b, size_t n) {
   const __m512i vn = _mm512_set1_epi8('N');
@@ -383,6 +386,11 @@ __attribute__((target("avx512bw"))) static int CountMismatchesAvx512(
   return mm;
 }
 static const bool kHaveAvx512bw = __builtin_cpu_supports("avx512bw");
+#else
+// Non-x86 (arm64): the stock loop below; same result by construction.
+static const bool kHaveAvx512bw = false;
+static int CountMismatchesAvx512(const char*, const char*, size_t) { return 0; }
+#endif
 
 // Align 2 same length strings by comparing each character.
 //

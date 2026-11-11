@@ -78,13 +78,15 @@ wait_for_dpkg_lock
 
 # See https://askubuntu.com/questions/909277.
 sudo -H DEBIAN_FRONTEND=noninteractive apt-get install "${APT_ARGS[@]}" pkg-config zip zlib1g-dev unzip curl git wget > /dev/null
-sudo -H apt-get install "${APT_ARGS[@]}" python3-distutils > /dev/null
+# On Ubuntu 24.04, python3-distutils doesn't exist; use python3.10-distutils from deadsnakes
+sudo -H apt-get install "${APT_ARGS[@]}" python3-distutils > /dev/null 2>&1 || \
+  sudo -H apt-get install "${APT_ARGS[@]}" python3.10-distutils > /dev/null 2>&1 || true
 
 note_build_stage "Install python3 packaging infrastructure"
 
 # Avoid issue with pip's dependency resolver not accounting for all installed
 # packages.
-sudo -H apt-get install "${APT_ARGS[@]}" "python3-testresources"
+sudo -H apt-get install "${APT_ARGS[@]}" "python3-testresources" 2>/dev/null || true
 
 # Fix this error:
 # "error: command 'x86_64-linux-gnu-gcc' failed: No such file or directory"
@@ -143,16 +145,22 @@ pip3 install "${PIP_ARGS[@]}" 'pandas==1.3.4'
 # See https://github.com/altair-viz/altair/issues/2496
 # If Altair version is updated below, the jsonschema version
 # should also be updated accordingly.
-pip3 install "${PIP_ARGS[@]}" 'jsonschema==3.2.0'
+pip3 install "${PIP_ARGS[@]}" --ignore-installed 'jsonschema==3.2.0'
 pip3 install "${PIP_ARGS[@]}" 'altair==4.1.0'
 pip3 install "${PIP_ARGS[@]}" 'Pillow==9.5.0'
 pip3 install "${PIP_ARGS[@]}" 'ipython==8.22.2'
 pip3 install "${PIP_ARGS[@]}" 'pysam==0.20.0'
 pip3 install "${PIP_ARGS[@]}" 'scikit-learn==1.0.2'
-pip3 install "${PIP_ARGS[@]}" 'setuptools==61.0.0'
+pip3 install "${PIP_ARGS[@]}" --ignore-installed 'setuptools==61.0.0'
 # This is to avoid ERROR: No matching distribution found for opencv-python-headless==4.5.2.52.
 # TODO: Make this the same as ${DV_GCP_OPTIMIZED_TF_WHL_VERSION}" later
-pip3 install "${PIP_ARGS[@]}"  "tf-models-official==2.13.1"
+# tf-models-official depends on tensorflow-text which has no aarch64 wheel.
+# Only needed for training (train.py), not inference. Install without deps on ARM64.
+if [ "$(uname -m)" = "aarch64" ]; then
+  pip3 install "${PIP_ARGS[@]}" --no-deps "tf-models-official==2.13.1" || true
+else
+  pip3 install "${PIP_ARGS[@]}" "tf-models-official==2.13.1"
+fi
 
 ################################################################################
 # TensorFlow
@@ -198,7 +206,7 @@ fi
 # ImportError: cannot import name 'soft_unicode' from 'markupsafe'.
 # So, forcing a downgrade. This isn't the best solution, but we need it to get
 # our tests pass.
-pip3 install "${PIP_ARGS[@]}" --upgrade 'markupsafe==2.0.1'
+pip3 install "${PIP_ARGS[@]}" --ignore-installed 'markupsafe==2.0.1'
 
 ################################################################################
 # CUDA

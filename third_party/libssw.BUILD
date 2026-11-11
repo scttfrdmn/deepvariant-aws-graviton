@@ -11,7 +11,10 @@ exports_files(["README.md"])
 cc_library(
     name = "ssw",
     srcs = ["src/ssw.c"],
-    hdrs = ["src/ssw.h"],
+    hdrs = [
+        "src/ssw.h",
+        "src/sse2neon.h",  # ARM64: SSE->NEON translation header shipped with libssw 1.2.5
+    ],
 )
 
 cc_binary(

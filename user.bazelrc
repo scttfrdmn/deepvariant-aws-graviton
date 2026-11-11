@@ -1,0 +1,9 @@
+# Override default --jobs 128 for machines with limited RAM (16 GB).
+# Each Bazel C++ action can use 2-4 GB, so limit to 4 concurrent jobs.
+build --jobs 56
+build --local_ram_resources=110000
+
+# GCC 13+ (Ubuntu 24.04) requires explicit cstdint include for uint64_t etc.
+# TF 2.13.1 doesn't have this fix, so add it globally.
+build --cxxopt=-include --cxxopt=cstdint
+build --host_cxxopt=-include --host_cxxopt=cstdint
