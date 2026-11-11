@@ -220,30 +220,7 @@ RUN apt-get -y update && \
   rm -rf /var/lib/apt/lists/*
 
 # ONNX Runtime for accelerated ARM64 inference
-RUN PATH="${HOME}/.local/bin:$PATH" pip3 install tf2onnx onnxruntime
-
-# Convert models to ONNX format for --use_onnx flag
-RUN python3 -m tf2onnx.convert --saved-model /opt/models/wgs --output /opt/models/wgs/model.onnx --opset 17 && \
-    python3 -m tf2onnx.convert --saved-model /opt/models/wes --output /opt/models/wes/model.onnx --opset 17 && \
-    python3 -m tf2onnx.convert --saved-model /opt/models/pacbio --output /opt/models/pacbio/model.onnx --opset 17
-
-# Download pre-validated INT8 WGS model (SNP F1=0.9978, INDEL F1=0.9962).
-# 21 MB vs 84 MB FP32. Optimal on non-BF16 platforms (2.3x over FP32).
-# Entrypoint auto-selects this when BF16 is not available.
-RUN wget -q -O /opt/models/wgs/model_int8_static.onnx \
-      https://github.com/antomicblitz/deepvariant-linux-arm64/releases/download/v1.9.0-arm64.5/model_int8_static.onnx
-
-# Scripts: entrypoint, autoconfig, parallel CV wrapper, quantization, ONNX conversion
-COPY scripts/docker_entrypoint.sh /opt/deepvariant/bin/docker_entrypoint.sh
-COPY scripts/autoconfig.sh /opt/deepvariant/scripts/autoconfig.sh
-COPY scripts/run_parallel_cv.sh /opt/deepvariant/scripts/run_parallel_cv.sh
-COPY scripts/quantize_static_onnx.py /opt/deepvariant/scripts/quantize_static_onnx.py
-COPY scripts/convert_model_onnx.py /opt/deepvariant/scripts/convert_model_onnx.py
-RUN chmod +x /opt/deepvariant/bin/docker_entrypoint.sh \
-             /opt/deepvariant/scripts/autoconfig.sh \
-             /opt/deepvariant/scripts/run_parallel_cv.sh
-
+# perf/arm64-exact: no ONNX/INT8 conversion and no port entrypoint (it forces BF16); run binaries directly.
 WORKDIR /opt/deepvariant
 
-ENTRYPOINT ["/opt/deepvariant/bin/docker_entrypoint.sh"]
 CMD ["/opt/deepvariant/bin/run_deepvariant", "--help"]
