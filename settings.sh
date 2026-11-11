@@ -125,3 +125,10 @@ function wait_for_dpkg_lock {
     fi
   done
 }
+
+# perf/arm64-exact: pip pin against 2026 bit-rot (same pin as aws-realign
+# hack/dv-build-constraints.txt). TF 2.13's extensions are built against numpy
+# 1.x; numpy 2 fails at import (pywrap_bfloat16: "Unable to convert function
+# return value"). Every prereq script sources this file.
+printf '%s\n' 'numpy==1.24.3' > /tmp/dv-pip-constraints.txt
+export PIP_CONSTRAINT=/tmp/dv-pip-constraints.txt
